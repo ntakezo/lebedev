@@ -9,9 +9,10 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/ntakezo/lebedev/har"
 	"github.com/ntakezo/lebedev/internal/capture"
 	"github.com/ntakezo/lebedev/internal/proxy"
-	"github.com/ntakezo/lebedev/internal/store"
+	"github.com/ntakezo/lebedev/model"
 )
 
 // harTime formats a capture instant as the ISO 8601 stamp HAR expects, in UTC
@@ -23,24 +24,24 @@ const harTime = "2006-01-02T15:04:05.000Z07:00"
 // bodies that are not valid UTF-8 are carried base64-encoded (the store never
 // touches the bytes), header and cookie order is preserved, and the TLS/HTTP2
 // fingerprint rides along in the custom _lebedev field.
-func entryFromTransaction(id string, tx proxy.Transaction, now time.Time) store.Entry {
+func entryFromTransaction(id string, tx proxy.Transaction, now time.Time) model.Entry {
 	req := tx.Request
 	resp := tx.Response
 
-	e := store.Entry{
+	e := model.Entry{
 		StartedDateTime: now.UTC().Format(harTime),
 		Request:         requestEntry(req),
 		Response:        responseEntry(req, resp),
-		Cache:           store.Cache{},
-		Timings:         store.Timings{Send: 0, Wait: 0, Receive: 0},
+		Cache:           har.Cache{},
+		Timings:         har.Timings{Send: 0, Wait: 0, Receive: 0},
 		Lebedev:         lebedevMeta(id, req, resp, tx),
 	}
 	return e
 }
 
-func requestEntry(req capture.Request) store.Request {
+func requestEntry(req capture.Request) har.Request {
 	body := req.Body()
-	r := store.Request{
+	r := har.Request{
 		Method:      req.Method(),
 		URL:         req.Scheme() + "://" + req.Authority() + req.Target(),
 		HTTPVersion: req.Proto(),
@@ -52,7 +53,7 @@ func requestEntry(req capture.Request) store.Request {
 	}
 	if len(body) > 0 {
 		text, enc := bodyText(body)
-		r.PostData = &store.PostData{
+		r.PostData = &har.PostData{
 			MimeType: headerValue(req.Headers(), "Content-Type"),
 			Text:     text,
 			Encoding: enc,
@@ -61,9 +62,9 @@ func requestEntry(req capture.Request) store.Request {
 	return r
 }
 
-func responseEntry(req capture.Request, resp capture.Response) store.Response {
+func responseEntry(req capture.Request, resp capture.Response) har.Response {
 	text, enc := bodyText(resp.Body)
-	r := store.Response{
+	r := har.Response{
 		Status:      resp.Status,
 		StatusText:  http.StatusText(resp.Status),
 		HTTPVersion: responseProto(req, resp),
@@ -72,7 +73,7 @@ func responseEntry(req capture.Request, resp capture.Response) store.Response {
 		RedirectURL: headerValue(resp.Headers, "Location"),
 		HeadersSize: -1,
 		BodySize:    len(resp.Body),
-		Content: store.Content{
+		Content: har.Content{
 			Size:     len(resp.Body),
 			MimeType: headerValue(resp.Headers, "Content-Type"),
 			Text:     text,
@@ -91,8 +92,8 @@ func responseProto(req capture.Request, resp capture.Response) string {
 	return req.Proto()
 }
 
-func lebedevMeta(id string, req capture.Request, resp capture.Response, tx proxy.Transaction) *store.Lebedev {
-	lb := &store.Lebedev{Session: id}
+func lebedevMeta(id string, req capture.Request, resp capture.Response, tx proxy.Transaction) *model.Lebedev {
+	lb := &model.Lebedev{Session: id}
 	if len(tx.ClientHello) > 0 {
 		lb.ClientHelloHex = hex.EncodeToString(tx.ClientHello)
 	}
@@ -107,12 +108,12 @@ func lebedevMeta(id string, req capture.Request, resp capture.Response, tx proxy
 	return lb
 }
 
-func http2Fingerprint(fp capture.HTTP2Fingerprint) *store.HTTP2 {
-	settings := make([]store.Setting, 0, len(fp.Settings()))
+func http2Fingerprint(fp capture.HTTP2Fingerprint) *model.HTTP2 {
+	settings := make([]model.Setting, 0, len(fp.Settings()))
 	for _, s := range fp.Settings() {
-		settings = append(settings, store.Setting{ID: s.ID, Value: s.Value})
+		settings = append(settings, model.Setting{ID: s.ID, Value: s.Value})
 	}
-	return &store.HTTP2{
+	return &model.HTTP2{
 		Settings:       settings,
 		ConnectionFlow: fp.ConnectionFlow(),
 		PseudoOrder:    fp.PseudoOrder(),
@@ -120,10 +121,10 @@ func http2Fingerprint(fp capture.HTTP2Fingerprint) *store.HTTP2 {
 	}
 }
 
-func toNVP(in []capture.Header) []store.NVP {
-	out := make([]store.NVP, len(in))
+func toNVP(in []capture.Header) []har.NVP {
+	out := make([]har.NVP, len(in))
 	for i, h := range in {
-		out[i] = store.NVP{Name: h.Name, Value: h.Value}
+		out[i] = har.NVP{Name: h.Name, Value: h.Value}
 	}
 	return out
 }
@@ -131,18 +132,18 @@ func toNVP(in []capture.Header) []store.NVP {
 // queryString parses target's query into ordered name/value pairs, preserving
 // order and duplicates. Percent-escapes are decoded per HAR convention; an
 // undecodable component is kept verbatim.
-func queryString(target string) []store.NVP {
+func queryString(target string) []har.NVP {
 	i := strings.IndexByte(target, '?')
 	if i < 0 || i == len(target)-1 {
-		return []store.NVP{}
+		return []har.NVP{}
 	}
-	out := []store.NVP{}
+	out := []har.NVP{}
 	for _, pair := range strings.Split(target[i+1:], "&") {
 		if pair == "" {
 			continue
 		}
 		name, value, _ := strings.Cut(pair, "=")
-		out = append(out, store.NVP{Name: unescape(name), Value: unescape(value)})
+		out = append(out, har.NVP{Name: unescape(name), Value: unescape(value)})
 	}
 	return out
 }
@@ -177,8 +178,8 @@ func headerValue(headers []capture.Header, name string) string {
 }
 
 // requestCookies parses the Cookie header into ordered name/value cookies.
-func requestCookies(headers []capture.Header) []store.Cookie {
-	out := []store.Cookie{}
+func requestCookies(headers []capture.Header) []har.Cookie {
+	out := []har.Cookie{}
 	header := http.Header{}
 	for _, h := range headers {
 		if strings.EqualFold(h.Name, "Cookie") {
@@ -187,14 +188,14 @@ func requestCookies(headers []capture.Header) []store.Cookie {
 	}
 	r := http.Request{Header: header}
 	for _, c := range r.Cookies() {
-		out = append(out, store.Cookie{Name: c.Name, Value: c.Value})
+		out = append(out, har.Cookie{Name: c.Name, Value: c.Value})
 	}
 	return out
 }
 
 // responseCookies parses Set-Cookie headers into cookies with their attributes.
-func responseCookies(headers []capture.Header) []store.Cookie {
-	out := []store.Cookie{}
+func responseCookies(headers []capture.Header) []har.Cookie {
+	out := []har.Cookie{}
 	header := http.Header{}
 	for _, h := range headers {
 		if strings.EqualFold(h.Name, "Set-Cookie") {
@@ -203,7 +204,7 @@ func responseCookies(headers []capture.Header) []store.Cookie {
 	}
 	resp := http.Response{Header: header}
 	for _, c := range resp.Cookies() {
-		sc := store.Cookie{Name: c.Name, Value: c.Value, Path: c.Path, Domain: c.Domain}
+		sc := har.Cookie{Name: c.Name, Value: c.Value, Path: c.Path, Domain: c.Domain}
 		if !c.Expires.IsZero() {
 			sc.Expires = c.Expires.UTC().Format(harTime)
 		}

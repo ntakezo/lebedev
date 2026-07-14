@@ -12,14 +12,14 @@ import (
 
 	"github.com/ntakezo/lebedev/internal/ca"
 	"github.com/ntakezo/lebedev/internal/proxy"
-	"github.com/ntakezo/lebedev/internal/store"
+	"github.com/ntakezo/lebedev/model"
 )
 
 // Recorder receives one HAR entry per completed transaction. *store.Store
 // satisfies it directly; callers that need dual-writing (memory plus a durable
 // store) provide their own implementation.
 type Recorder interface {
-	Insert(ctx context.Context, session string, e store.Entry, at int64) (int64, error)
+	Insert(ctx context.Context, session string, e model.Entry, at int64) (int64, error)
 }
 
 // Config is the per-session configuration. OutboundProxy, when set, routes this

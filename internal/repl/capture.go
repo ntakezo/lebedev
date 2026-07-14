@@ -10,16 +10,21 @@ import (
 	"github.com/ntakezo/lebedev/internal/ca"
 	"github.com/ntakezo/lebedev/internal/session"
 	"github.com/ntakezo/lebedev/internal/store"
+	"github.com/ntakezo/lebedev/model"
 )
 
 // capture is one proxy run. Its entries accumulate in an in-memory store and are
-// discarded when the capture is closed; use export or import against the durable
-// store to keep anything worth keeping.
+// discarded when the capture is closed; use save or export to keep anything worth
+// keeping. A stopped capture can be resumed: it retains the CA authority, upstream
+// proxy, and bound address needed to re-serve the same in-memory session.
 type capture struct {
-	id  string
-	mem *store.Store
+	id            string
+	mem           *store.Store
+	authority     *ca.Authority
+	upstreamProxy string
 
 	mu       sync.Mutex
+	bindAddr string // concrete bound address, reused when resuming
 	ln       net.Listener
 	serveErr chan error
 	running  bool
@@ -32,25 +37,50 @@ func startCapture(id, addr, upstreamProxy string, authority *ca.Authority) (*cap
 	if err != nil {
 		return nil, err
 	}
-	ln, err := net.Listen("tcp", addr)
-	if err != nil {
+	c := &capture{
+		id:            id,
+		mem:           mem,
+		authority:     authority,
+		upstreamProxy: upstreamProxy,
+		bindAddr:      addr,
+	}
+	if err := c.serve(); err != nil {
 		mem.Close()
 		return nil, err
 	}
-	c := &capture{
-		id:       id,
-		mem:      mem,
-		ln:       ln,
-		serveErr: make(chan error, 1),
-		running:  true,
-	}
-	sess := session.New(session.Config{ID: id, OutboundProxy: upstreamProxy}, authority, c)
-	go func() { c.serveErr <- sess.Serve(ln) }()
 	return c, nil
 }
 
+// serve opens the listener on c.bindAddr and starts the proxy serve loop, pinning
+// the concrete bound address so a later resume rebinds the same endpoint. Callers
+// must ensure the capture is not already running.
+func (c *capture) serve() error {
+	ln, err := net.Listen("tcp", c.bindAddr)
+	if err != nil {
+		return err
+	}
+	c.bindAddr = ln.Addr().String()
+	c.ln = ln
+	c.serveErr = make(chan error, 1)
+	c.running = true
+	sess := session.New(session.Config{ID: c.id, OutboundProxy: c.upstreamProxy}, c.authority, c)
+	go func() { c.serveErr <- sess.Serve(ln) }()
+	return nil
+}
+
+// resume re-serves a stopped capture on its original address, appending new
+// transactions to the same in-memory session.
+func (c *capture) resume() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.running {
+		return errors.New("capture is already running")
+	}
+	return c.serve()
+}
+
 // Insert records an entry into the in-memory store.
-func (c *capture) Insert(ctx context.Context, sessionID string, e store.Entry, at int64) (int64, error) {
+func (c *capture) Insert(ctx context.Context, sessionID string, e model.Entry, at int64) (int64, error) {
 	return c.mem.Insert(ctx, sessionID, e, at)
 }
 

@@ -1,11 +1,9 @@
-// Package store persists captured transactions in SQL (SQLite in-memory by
-// default, on-disk SQLite, or PostgreSQL) and marshals them to and from the
-// HTTP Archive (HAR) 1.3 format for import and export. The Go types in this file
-// mirror the HAR 1.3 object model; their JSON tags define the on-the-wire format.
-// Lebedev-specific data that HAR has no home for (the raw TLS ClientHello and the
-// HTTP/2 fingerprint) rides along in the custom, underscore-prefixed "_lebedev"
-// field permitted by the HAR custom-field rules.
-package store
+// Package har is the strict HTTP Archive (HAR) 1.3 object model. Every type here
+// mirrors the HAR 1.3 specification exactly; the JSON tags define the on-the-wire
+// format. The package carries no lebedev business logic — no capture fingerprint,
+// no store identity — so it can be imported as a standalone HAR typing definition.
+// lebedev's extension of this model lives in the sibling package model.
+package har
 
 // HAR is the root of a HAR document: a single log wrapper.
 type HAR struct {
@@ -52,8 +50,8 @@ type PageTimings struct {
 	Comment       string   `json:"comment,omitempty"`
 }
 
-// Entry is one HTTP request/response round trip. Lebedev carries the TLS and
-// HTTP/2 fingerprint in the custom _lebedev field.
+// Entry is one HTTP request/response round trip as defined by HAR 1.3. It carries
+// no lebedev-specific fields; the extended entry lives in package model.
 type Entry struct {
 	Pageref         string   `json:"pageref,omitempty"`
 	StartedDateTime string   `json:"startedDateTime"`
@@ -65,7 +63,6 @@ type Entry struct {
 	ServerIPAddress string   `json:"serverIPAddress,omitempty"`
 	Connection      string   `json:"connection,omitempty"`
 	Comment         string   `json:"comment,omitempty"`
-	Lebedev         *Lebedev `json:"_lebedev,omitempty"`
 }
 
 // Request is the performed request. HeadersSize/BodySize default to -1 (unknown).
@@ -139,7 +136,7 @@ type Param struct {
 }
 
 // Content is the response body. Encoding (e.g. "base64") is set when Text is not
-// stored as decoded UTF-8 — Lebedev uses it to carry binary or compressed bytes.
+// stored as decoded UTF-8, so binary or otherwise non-UTF-8 bytes survive intact.
 type Content struct {
 	Size        int    `json:"size"`
 	Compression *int   `json:"compression,omitempty"`
@@ -177,28 +174,4 @@ type Timings struct {
 	Receive float64  `json:"receive"`
 	SSL     *float64 `json:"ssl,omitempty"`
 	Comment string   `json:"comment,omitempty"`
-}
-
-// Lebedev is the custom _lebedev entry field carrying data outside the HAR model:
-// the session id, the raw TLS ClientHello, the upstream protocol actually spoken,
-// and the HTTP/2 fingerprint.
-type Lebedev struct {
-	Session        string `json:"session,omitempty"`
-	ClientHelloHex string `json:"clientHelloHex,omitempty"`
-	UpstreamProto  string `json:"upstreamProto,omitempty"`
-	HTTP2          *HTTP2 `json:"http2,omitempty"`
-}
-
-// HTTP2 is the mirrored HTTP/2 fingerprint.
-type HTTP2 struct {
-	Settings       []Setting `json:"settings,omitempty"`
-	ConnectionFlow uint32    `json:"connectionFlow,omitempty"`
-	PseudoOrder    []string  `json:"pseudoOrder,omitempty"`
-	HeaderOrder    []string  `json:"headerOrder,omitempty"`
-}
-
-// Setting is one HTTP/2 SETTINGS id/value pair.
-type Setting struct {
-	ID    uint16 `json:"id"`
-	Value uint32 `json:"value"`
 }

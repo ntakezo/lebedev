@@ -1,3 +1,11 @@
+// Package store persists captured transactions in SQL (SQLite in-memory by
+// default, on-disk SQLite, or PostgreSQL) and marshals them to and from the
+// HTTP Archive (HAR) 1.3 format for import and export.
+//
+// The data it reads and writes is typed by two importable packages, not by store
+// itself: the strict HAR 1.3 object model in package har, and lebedev's extension
+// of it — the _lebedev capture fingerprint and the store identity — in package
+// model. store operates on those types directly.
 package store
 
 import (
@@ -9,6 +17,9 @@ import (
 
 	_ "github.com/jackc/pgx/v5/stdlib"
 	_ "modernc.org/sqlite"
+
+	"github.com/ntakezo/lebedev/har"
+	"github.com/ntakezo/lebedev/model"
 )
 
 // Store is a SQL-backed collection of captured HAR entries. It is safe for
@@ -84,12 +95,12 @@ func (s *Store) migrate(ctx context.Context) error {
 
 // PutLog records or updates the log-level metadata (creator, browser, comment)
 // for a session. Entries are stored separately via Insert.
-func (s *Store) PutLog(ctx context.Context, session string, log Log) error {
+func (s *Store) PutLog(ctx context.Context, session string, log model.Log) error {
 	version := log.Version
 	if version == "" {
 		version = "1.3"
 	}
-	var b Browser
+	var b har.Browser
 	if log.Browser != nil {
 		b = *log.Browser
 	}
@@ -112,7 +123,7 @@ func (s *Store) PutLog(ctx context.Context, session string, log Log) error {
 // milliseconds, used only for internal ordering), and returns its assigned id.
 // The entry and its ordered child rows are written in a single transaction so a
 // reader never sees a partially materialized entry.
-func (s *Store) Insert(ctx context.Context, session string, e Entry, at int64) (int64, error) {
+func (s *Store) Insert(ctx context.Context, session string, e model.Entry, at int64) (int64, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return 0, err
@@ -128,15 +139,15 @@ func (s *Store) Insert(ctx context.Context, session string, e Entry, at int64) (
 	return id, nil
 }
 
-func (s *Store) insertEntry(ctx context.Context, tx *sql.Tx, session string, e Entry, at int64) (int64, error) {
-	var post PostData
+func (s *Store) insertEntry(ctx context.Context, tx *sql.Tx, session string, e model.Entry, at int64) (int64, error) {
+	var post har.PostData
 	hasPost := 0
 	if e.Request.PostData != nil {
 		post = *e.Request.PostData
 		hasPost = 1
 	}
 	http2JSON := ""
-	var lb Lebedev
+	var lb model.Lebedev
 	if e.Lebedev != nil {
 		lb = *e.Lebedev
 		if lb.HTTP2 != nil {
@@ -213,7 +224,7 @@ func (s *Store) execInsert(ctx context.Context, tx *sql.Tx, query string, args .
 	return res.LastInsertId()
 }
 
-func (s *Store) insertHeaders(ctx context.Context, tx *sql.Tx, id int64, kind string, hs []NVP) error {
+func (s *Store) insertHeaders(ctx context.Context, tx *sql.Tx, id int64, kind string, hs []har.NVP) error {
 	q := s.d.rebind(`INSERT INTO headers (entry_id, kind, seq, name, value, comment) VALUES (?, ?, ?, ?, ?, ?)`)
 	for i, h := range hs {
 		if _, err := tx.ExecContext(ctx, q, id, kind, i, h.Name, h.Value, h.Comment); err != nil {
@@ -223,7 +234,7 @@ func (s *Store) insertHeaders(ctx context.Context, tx *sql.Tx, id int64, kind st
 	return nil
 }
 
-func (s *Store) insertCookies(ctx context.Context, tx *sql.Tx, id int64, kind string, cs []Cookie) error {
+func (s *Store) insertCookies(ctx context.Context, tx *sql.Tx, id int64, kind string, cs []har.Cookie) error {
 	q := s.d.rebind(`INSERT INTO cookies (entry_id, kind, seq, name, value, path, domain, expires, http_only, secure, comment)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
 	for i, c := range cs {
@@ -234,7 +245,7 @@ func (s *Store) insertCookies(ctx context.Context, tx *sql.Tx, id int64, kind st
 	return nil
 }
 
-func (s *Store) insertQueryParams(ctx context.Context, tx *sql.Tx, id int64, ps []NVP) error {
+func (s *Store) insertQueryParams(ctx context.Context, tx *sql.Tx, id int64, ps []har.NVP) error {
 	q := s.d.rebind(`INSERT INTO query_params (entry_id, seq, name, value, comment) VALUES (?, ?, ?, ?, ?)`)
 	for i, p := range ps {
 		if _, err := tx.ExecContext(ctx, q, id, i, p.Name, p.Value, p.Comment); err != nil {
@@ -244,7 +255,7 @@ func (s *Store) insertQueryParams(ctx context.Context, tx *sql.Tx, id int64, ps 
 	return nil
 }
 
-func (s *Store) insertPostParams(ctx context.Context, tx *sql.Tx, id int64, ps []Param) error {
+func (s *Store) insertPostParams(ctx context.Context, tx *sql.Tx, id int64, ps []har.Param) error {
 	q := s.d.rebind(`INSERT INTO post_params (entry_id, seq, name, value, file_name, content_type, encoding, comment)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?)`)
 	for i, p := range ps {
@@ -255,7 +266,7 @@ func (s *Store) insertPostParams(ctx context.Context, tx *sql.Tx, id int64, ps [
 	return nil
 }
 
-func (s *Store) insertCacheState(ctx context.Context, tx *sql.Tx, id int64, kind string, cs *CacheState) error {
+func (s *Store) insertCacheState(ctx context.Context, tx *sql.Tx, id int64, kind string, cs *har.CacheState) error {
 	if cs == nil {
 		return nil
 	}

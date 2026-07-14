@@ -5,15 +5,10 @@ import (
 	"database/sql"
 	"encoding/json"
 	"strings"
-)
 
-// Stored is one persisted entry together with the store identity that HAR itself
-// does not carry: the row id and the owning session.
-type Stored struct {
-	ID      int64
-	Session string
-	Entry   Entry
-}
+	"github.com/ntakezo/lebedev/har"
+	"github.com/ntakezo/lebedev/model"
+)
 
 // Query selects and orders stored entries. A zero-valued field imposes no
 // constraint on that dimension. Entries are ordered by id — ascending (insertion
@@ -69,7 +64,7 @@ func (q Query) where() (string, []any) {
 }
 
 // List returns the entries matching q in the requested order.
-func (s *Store) List(ctx context.Context, q Query) ([]Stored, error) {
+func (s *Store) List(ctx context.Context, q Query) ([]model.Stored, error) {
 	where, args := q.where()
 	order := " ORDER BY id DESC"
 	if q.Ascending {
@@ -90,7 +85,7 @@ func (s *Store) List(ctx context.Context, q Query) ([]Stored, error) {
 	}
 	defer rows.Close()
 
-	var out []Stored
+	var out []model.Stored
 	for rows.Next() {
 		st, err := scanEntry(rows)
 		if err != nil {
@@ -121,14 +116,14 @@ func (s *Store) Count(ctx context.Context, q Query) (int, error) {
 }
 
 // Get returns the single entry with the given id, or sql.ErrNoRows if absent.
-func (s *Store) Get(ctx context.Context, id int64) (Stored, error) {
+func (s *Store) Get(ctx context.Context, id int64) (model.Stored, error) {
 	row := s.db.QueryRowContext(ctx, s.d.rebind("SELECT "+entryColumns+" FROM entries WHERE id = ?"), id)
 	st, err := scanEntry(row)
 	if err != nil {
-		return Stored{}, err
+		return model.Stored{}, err
 	}
 	if err := s.loadChildren(ctx, &st); err != nil {
-		return Stored{}, err
+		return model.Stored{}, err
 	}
 	return st, nil
 }
@@ -153,20 +148,20 @@ func (s *Store) Sessions(ctx context.Context) ([]string, error) {
 
 // GetLog returns the stored log-level metadata for a session. When no row exists
 // it returns a zero Log with Version defaulted, so export always has a valid log.
-func (s *Store) GetLog(ctx context.Context, session string) (Log, error) {
+func (s *Store) GetLog(ctx context.Context, session string) (model.Log, error) {
 	row := s.db.QueryRowContext(ctx, s.d.rebind(`SELECT version, creator_name, creator_version, creator_comment,
 		browser_name, browser_version, browser_comment, comment FROM logs WHERE session = ?`), session)
-	var l Log
-	var b Browser
+	var l model.Log
+	var b har.Browser
 	err := row.Scan(&l.Version, &l.Creator.Name, &l.Creator.Version, &l.Creator.Comment,
 		&b.Name, &b.Version, &b.Comment, &l.Comment)
 	if err == sql.ErrNoRows {
-		return Log{Version: "1.3"}, nil
+		return model.Log{Version: "1.3"}, nil
 	}
 	if err != nil {
-		return Log{}, err
+		return model.Log{}, err
 	}
-	if b != (Browser{}) {
+	if b != (har.Browser{}) {
 		l.Browser = &b
 	}
 	return l, nil
@@ -180,14 +175,14 @@ type scanRow interface {
 // scanEntry reads one entries row into a Stored, leaving child collections to
 // loadChildren. Nullable columns are read through sql.Null* and converted back to
 // the pointer or zero values the HAR types expect.
-func scanEntry(row scanRow) (Stored, error) {
-	var st Stored
+func scanEntry(row scanRow) (model.Stored, error) {
+	var st model.Stored
 	e := &st.Entry
 	var (
 		createdAt                                    int64
 		reqHeadersComp, respHeadersComp, contentComp sql.NullInt64
 		hasPost                                      int
-		post                                         PostData
+		post                                         har.PostData
 		blocked, dns, connect, ssl                   sql.NullFloat64
 		clientHello, upstreamProto, http2JSON        string
 	)
@@ -201,7 +196,7 @@ func scanEntry(row scanRow) (Stored, error) {
 		&e.Cache.Comment, &clientHello, &upstreamProto, &http2JSON,
 	)
 	if err != nil {
-		return Stored{}, err
+		return model.Stored{}, err
 	}
 	e.Request.HeadersCompression = intPtr(reqHeadersComp)
 	e.Response.HeadersCompression = intPtr(respHeadersComp)
@@ -219,10 +214,10 @@ func scanEntry(row scanRow) (Stored, error) {
 	return st, nil
 }
 
-func buildLebedev(session, clientHello, upstreamProto, http2JSON string) *Lebedev {
-	lb := Lebedev{Session: session, ClientHelloHex: clientHello, UpstreamProto: upstreamProto}
+func buildLebedev(session, clientHello, upstreamProto, http2JSON string) *model.Lebedev {
+	lb := model.Lebedev{Session: session, ClientHelloHex: clientHello, UpstreamProto: upstreamProto}
 	if http2JSON != "" {
-		var h HTTP2
+		var h model.HTTP2
 		if err := json.Unmarshal([]byte(http2JSON), &h); err == nil {
 			lb.HTTP2 = &h
 		}
@@ -235,7 +230,7 @@ func buildLebedev(session, clientHello, upstreamProto, http2JSON string) *Lebede
 
 // loadChildren fills the ordered collections hanging off an entry. Every list is
 // ordered by seq so header, cookie, and parameter order is reproduced exactly.
-func (s *Store) loadChildren(ctx context.Context, st *Stored) error {
+func (s *Store) loadChildren(ctx context.Context, st *model.Stored) error {
 	e := &st.Entry
 	var err error
 	if e.Request.Headers, err = s.loadHeaders(ctx, st.ID, "request"); err != nil {
@@ -267,15 +262,15 @@ func (s *Store) loadChildren(ctx context.Context, st *Stored) error {
 	return nil
 }
 
-func (s *Store) loadHeaders(ctx context.Context, id int64, kind string) ([]NVP, error) {
+func (s *Store) loadHeaders(ctx context.Context, id int64, kind string) ([]har.NVP, error) {
 	rows, err := s.db.QueryContext(ctx, s.d.rebind(`SELECT name, value, comment FROM headers WHERE entry_id = ? AND kind = ? ORDER BY seq`), id, kind)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	out := []NVP{}
+	out := []har.NVP{}
 	for rows.Next() {
-		var h NVP
+		var h har.NVP
 		if err := rows.Scan(&h.Name, &h.Value, &h.Comment); err != nil {
 			return nil, err
 		}
@@ -284,16 +279,16 @@ func (s *Store) loadHeaders(ctx context.Context, id int64, kind string) ([]NVP, 
 	return out, rows.Err()
 }
 
-func (s *Store) loadCookies(ctx context.Context, id int64, kind string) ([]Cookie, error) {
+func (s *Store) loadCookies(ctx context.Context, id int64, kind string) ([]har.Cookie, error) {
 	rows, err := s.db.QueryContext(ctx, s.d.rebind(`SELECT name, value, path, domain, expires, http_only, secure, comment
 		FROM cookies WHERE entry_id = ? AND kind = ? ORDER BY seq`), id, kind)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	out := []Cookie{}
+	out := []har.Cookie{}
 	for rows.Next() {
-		var c Cookie
+		var c har.Cookie
 		var httpOnly, secure sql.NullInt64
 		if err := rows.Scan(&c.Name, &c.Value, &c.Path, &c.Domain, &c.Expires, &httpOnly, &secure, &c.Comment); err != nil {
 			return nil, err
@@ -305,15 +300,15 @@ func (s *Store) loadCookies(ctx context.Context, id int64, kind string) ([]Cooki
 	return out, rows.Err()
 }
 
-func (s *Store) loadQueryParams(ctx context.Context, id int64) ([]NVP, error) {
+func (s *Store) loadQueryParams(ctx context.Context, id int64) ([]har.NVP, error) {
 	rows, err := s.db.QueryContext(ctx, s.d.rebind(`SELECT name, value, comment FROM query_params WHERE entry_id = ? ORDER BY seq`), id)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	out := []NVP{}
+	out := []har.NVP{}
 	for rows.Next() {
-		var p NVP
+		var p har.NVP
 		if err := rows.Scan(&p.Name, &p.Value, &p.Comment); err != nil {
 			return nil, err
 		}
@@ -322,16 +317,16 @@ func (s *Store) loadQueryParams(ctx context.Context, id int64) ([]NVP, error) {
 	return out, rows.Err()
 }
 
-func (s *Store) loadPostParams(ctx context.Context, id int64) ([]Param, error) {
+func (s *Store) loadPostParams(ctx context.Context, id int64) ([]har.Param, error) {
 	rows, err := s.db.QueryContext(ctx, s.d.rebind(`SELECT name, value, file_name, content_type, encoding, comment
 		FROM post_params WHERE entry_id = ? ORDER BY seq`), id)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	var out []Param
+	var out []har.Param
 	for rows.Next() {
-		var p Param
+		var p har.Param
 		if err := rows.Scan(&p.Name, &p.Value, &p.FileName, &p.ContentType, &p.Encoding, &p.Comment); err != nil {
 			return nil, err
 		}
@@ -340,10 +335,10 @@ func (s *Store) loadPostParams(ctx context.Context, id int64) ([]Param, error) {
 	return out, rows.Err()
 }
 
-func (s *Store) loadCacheState(ctx context.Context, id int64, kind string) (*CacheState, error) {
+func (s *Store) loadCacheState(ctx context.Context, id int64, kind string) (*har.CacheState, error) {
 	row := s.db.QueryRowContext(ctx, s.d.rebind(`SELECT expires, last_access, etag, hit_count, comment
 		FROM cache_states WHERE entry_id = ? AND kind = ?`), id, kind)
-	var c CacheState
+	var c har.CacheState
 	err := row.Scan(&c.Expires, &c.LastAccess, &c.ETag, &c.HitCount, &c.Comment)
 	if err == sql.ErrNoRows {
 		return nil, nil

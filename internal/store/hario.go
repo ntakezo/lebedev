@@ -4,6 +4,9 @@ import (
 	"context"
 	"encoding/json"
 	"io"
+
+	"github.com/ntakezo/lebedev/har"
+	"github.com/ntakezo/lebedev/model"
 )
 
 // Export writes the entries matching q as a single HAR 1.3 document to w. The log
@@ -19,20 +22,20 @@ func (s *Store) Export(ctx context.Context, q Query, w io.Writer) error {
 	if err != nil {
 		return err
 	}
-	log.Entries = make([]Entry, len(stored))
+	log.Entries = make([]model.Entry, len(stored))
 	for i, st := range stored {
 		log.Entries[i] = st.Entry
 	}
 	enc := json.NewEncoder(w)
 	enc.SetIndent("", "  ")
-	return enc.Encode(HAR{Log: log})
+	return enc.Encode(model.HAR{Log: log})
 }
 
-func (s *Store) exportLog(ctx context.Context, session string) (Log, error) {
+func (s *Store) exportLog(ctx context.Context, session string) (model.Log, error) {
 	if session != "" {
 		log, err := s.GetLog(ctx, session)
 		if err != nil {
-			return Log{}, err
+			return model.Log{}, err
 		}
 		if log.Creator.Name != "" {
 			return log, nil
@@ -40,16 +43,16 @@ func (s *Store) exportLog(ctx context.Context, session string) (Log, error) {
 		log.Creator = defaultCreator()
 		return log, nil
 	}
-	return Log{Version: "1.3", Creator: defaultCreator()}, nil
+	return model.Log{Version: "1.3", Creator: defaultCreator()}, nil
 }
 
-func defaultCreator() Creator { return Creator{Name: "lebedev", Version: "1.3"} }
+func defaultCreator() har.Creator { return har.Creator{Name: "lebedev", Version: "1.3"} }
 
 // Import reads a HAR 1.3 document from r and stores every entry under session,
 // upserting the log-level metadata. It returns the number of entries stored; on
 // the first insert error it returns the count stored so far and that error.
 func (s *Store) Import(ctx context.Context, session string, r io.Reader) (int, error) {
-	var h HAR
+	var h model.HAR
 	if err := json.NewDecoder(r).Decode(&h); err != nil {
 		return 0, err
 	}

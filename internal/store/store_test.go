@@ -5,42 +5,45 @@ import (
 	"context"
 	"reflect"
 	"testing"
+
+	"github.com/ntakezo/lebedev/har"
+	"github.com/ntakezo/lebedev/model"
 )
 
-func sampleEntry() Entry {
+func sampleEntry() model.Entry {
 	httpOnly := true
 	secure := false
-	return Entry{
+	return model.Entry{
 		StartedDateTime: "2026-07-13T00:00:00.000Z",
 		Time:            0,
-		Request: Request{
+		Request: har.Request{
 			Method:      "POST",
 			URL:         "https://example.com/api?b=2&a=1",
 			HTTPVersion: "HTTP/2.0",
-			Cookies:     []Cookie{{Name: "sid", Value: "xyz"}},
-			Headers:     []NVP{{Name: "user-agent", Value: "UA"}, {Name: "accept", Value: "*/*"}},
-			QueryString: []NVP{{Name: "b", Value: "2"}, {Name: "a", Value: "1"}},
-			PostData:    &PostData{MimeType: "application/json", Text: `{"k":"v"}`},
+			Cookies:     []har.Cookie{{Name: "sid", Value: "xyz"}},
+			Headers:     []har.NVP{{Name: "user-agent", Value: "UA"}, {Name: "accept", Value: "*/*"}},
+			QueryString: []har.NVP{{Name: "b", Value: "2"}, {Name: "a", Value: "1"}},
+			PostData:    &har.PostData{MimeType: "application/json", Text: `{"k":"v"}`},
 			HeadersSize: -1,
 			BodySize:    9,
 		},
-		Response: Response{
+		Response: har.Response{
 			Status:      200,
 			StatusText:  "OK",
 			HTTPVersion: "HTTP/2.0",
-			Cookies:     []Cookie{{Name: "set", Value: "1", Path: "/", HTTPOnly: &httpOnly, Secure: &secure}},
-			Headers:     []NVP{{Name: "content-type", Value: "application/json"}},
-			Content:     Content{Size: 2, MimeType: "application/json", Text: "{}"},
+			Cookies:     []har.Cookie{{Name: "set", Value: "1", Path: "/", HTTPOnly: &httpOnly, Secure: &secure}},
+			Headers:     []har.NVP{{Name: "content-type", Value: "application/json"}},
+			Content:     har.Content{Size: 2, MimeType: "application/json", Text: "{}"},
 			RedirectURL: "",
 			HeadersSize: -1,
 			BodySize:    2,
 		},
-		Cache:   Cache{},
-		Timings: Timings{Send: 0, Wait: 0, Receive: 0},
-		Lebedev: &Lebedev{
+		Cache:   har.Cache{},
+		Timings: har.Timings{Send: 0, Wait: 0, Receive: 0},
+		Lebedev: &model.Lebedev{
 			Session:        "s1",
 			ClientHelloHex: "1603010001ff",
-			HTTP2:          &HTTP2{Settings: []Setting{{ID: 1, Value: 65536}}, ConnectionFlow: 15663105, PseudoOrder: []string{":method", ":path"}, HeaderOrder: []string{"user-agent"}},
+			HTTP2:          &model.HTTP2{Settings: []model.Setting{{ID: 1, Value: 65536}}, ConnectionFlow: 15663105, PseudoOrder: []string{":method", ":path"}, HeaderOrder: []string{"user-agent"}},
 		},
 	}
 }
@@ -170,14 +173,14 @@ func TestExportImportRoundTrip(t *testing.T) {
 	want := sampleEntry()
 	src.Insert(ctx, "s1", want, 1)
 
-	var har bytes.Buffer
-	if err := src.Export(ctx, Query{Session: "s1"}, &har); err != nil {
+	var buf bytes.Buffer
+	if err := src.Export(ctx, Query{Session: "s1"}, &buf); err != nil {
 		t.Fatal(err)
 	}
 
 	dst, _ := Open("")
 	defer dst.Close()
-	n, err := dst.Import(ctx, "s2", &har)
+	n, err := dst.Import(ctx, "s2", &buf)
 	if err != nil {
 		t.Fatal(err)
 	}

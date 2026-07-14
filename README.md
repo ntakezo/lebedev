@@ -144,7 +144,8 @@ growing session without duplicating entries.
 run [id] [--addr :8080] [--upstream-proxy URL]
                        start a capture; entries stay in memory only
 save                   write the live session to the durable store
-stop                   stop the active capture (its session stays queryable)
+stop <id>              stop the capture (its session stays queryable)
+resume <id>            resume a stopped capture on its address
 sessions | ls          list stored sessions (and the live one, if any)
 show <id> [limit]      list a session's entries
 export <id> [file]     write a session as HAR 1.3 (stdout if no file)
@@ -157,9 +158,12 @@ help | quit
 ```
 
 `run` takes an optional session id (default `default`), the listen address, and
-an optional per-session outbound proxy. `save` writes the active capture to the
-durable store; `show`, `export`, and `sessions` operate on the live in-memory
-session when the id names the active capture, and on the durable store otherwise.
+an optional per-session outbound proxy. `stop <id>` pauses the capture named by
+id, leaving its in-memory session queryable; `resume <id>` re-serves it on the
+same address, appending new transactions to the same session. `save` writes the
+active capture to the durable store; `show`, `export`, and `sessions` operate on
+the live in-memory session when the id names the active capture, and on the
+durable store otherwise.
 
 ### Global flags
 

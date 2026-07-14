@@ -4,16 +4,19 @@ import (
 	"context"
 	"testing"
 
+	"github.com/ntakezo/lebedev/har"
+	"github.com/ntakezo/lebedev/internal/ca"
 	"github.com/ntakezo/lebedev/internal/store"
+	"github.com/ntakezo/lebedev/model"
 )
 
-func testEntry(url string) store.Entry {
-	return store.Entry{
+func testEntry(url string) model.Entry {
+	return model.Entry{
 		StartedDateTime: "2026-07-13T00:00:00.000Z",
-		Request:         store.Request{Method: "GET", URL: url, HTTPVersion: "HTTP/2.0", Cookies: []store.Cookie{}, Headers: []store.NVP{}, QueryString: []store.NVP{}, HeadersSize: -1},
-		Response:        store.Response{Status: 200, StatusText: "OK", HTTPVersion: "HTTP/2.0", Cookies: []store.Cookie{}, Headers: []store.NVP{}, HeadersSize: -1, Content: store.Content{}},
-		Cache:           store.Cache{},
-		Timings:         store.Timings{},
+		Request:         har.Request{Method: "GET", URL: url, HTTPVersion: "HTTP/2.0", Cookies: []har.Cookie{}, Headers: []har.NVP{}, QueryString: []har.NVP{}, HeadersSize: -1},
+		Response:        har.Response{Status: 200, StatusText: "OK", HTTPVersion: "HTTP/2.0", Cookies: []har.Cookie{}, Headers: []har.NVP{}, HeadersSize: -1, Content: har.Content{}},
+		Cache:           har.Cache{},
+		Timings:         har.Timings{},
 	}
 }
 
@@ -86,3 +89,45 @@ func TestSave(t *testing.T) {
 type discard struct{}
 
 func (discard) Write(p []byte) (int, error) { return len(p), nil }
+
+// TestStopResume verifies that a capture can be stopped and then resumed on the
+// same bound address, and that the in-memory session survives the pause.
+func TestStopResume(t *testing.T) {
+	authority, err := ca.Generate("test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	c, err := startCapture("s1", "127.0.0.1:0", "", authority)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.close()
+
+	if !c.running {
+		t.Fatal("expected capture to be running after start")
+	}
+	addr := c.addr()
+
+	// An entry recorded before the pause must still be there afterward.
+	c.Insert(context.Background(), "s1", testEntry("https://a/1"), 1)
+
+	if err := c.stop(); err != nil {
+		t.Fatal(err)
+	}
+	if c.running {
+		t.Fatal("expected capture to be stopped after stop")
+	}
+
+	if err := c.resume(); err != nil {
+		t.Fatal(err)
+	}
+	if !c.running {
+		t.Fatal("expected capture to be running after resume")
+	}
+	if got := c.addr(); got != addr {
+		t.Fatalf("resumed on %s, want same address %s", got, addr)
+	}
+	if n, _ := c.count(context.Background()); n != 1 {
+		t.Fatalf("entry count after resume = %d, want 1 (session survives pause)", n)
+	}
+}

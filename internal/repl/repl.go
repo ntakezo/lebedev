@@ -15,9 +15,11 @@ import (
 	"runtime"
 	"strings"
 
+	"github.com/ntakezo/lebedev/har"
 	"github.com/ntakezo/lebedev/internal/browser"
 	"github.com/ntakezo/lebedev/internal/ca"
 	"github.com/ntakezo/lebedev/internal/store"
+	"github.com/ntakezo/lebedev/model"
 )
 
 // REPL holds the durable store, the CA used to mint leaves, and the current
@@ -74,7 +76,9 @@ func (r *REPL) dispatch(line string) (quit bool) {
 	case "save":
 		r.cmdSave(ctx)
 	case "stop":
-		r.cmdStop()
+		r.cmdStop(args)
+	case "resume":
+		r.cmdResume(args)
 	case "sessions", "ls":
 		r.cmdSessions(ctx)
 	case "show", "cat":
@@ -104,7 +108,8 @@ func (r *REPL) help() {
   run [id] [--addr :8080] [--upstream-proxy URL]
                          start a capture; entries stay in memory only
   save                   write the live session to the durable store
-  stop                   stop the active capture (its session stays queryable)
+  stop <id>              stop the capture (its session stays queryable)
+  resume <id>            resume a stopped capture on its address
   sessions | ls          list stored sessions (and the live one, if any)
   show <id> [limit]      list a session's entries
   export <id> [file]     write a session as HAR 1.3 (stdout if no file)
@@ -141,7 +146,7 @@ func (r *REPL) cmdRun(args []string) {
 	}
 
 	if r.current != nil && r.current.running {
-		r.printf("a capture is already active on %s — 'stop' it first", r.current.addr())
+		r.printf("capture %q is already active on %s — 'stop %s' first", r.current.id, r.current.addr(), r.current.id)
 		return
 	}
 	if r.current != nil {
@@ -180,7 +185,7 @@ func (r *REPL) cmdSave(ctx context.Context) {
 		r.printf("save: %v", err)
 		return
 	}
-	if err := r.durable.PutLog(ctx, id, store.Log{Version: "1.3", Creator: store.Creator{Name: "lebedev", Version: "1.3"}}); err != nil {
+	if err := r.durable.PutLog(ctx, id, model.Log{Version: "1.3", Creator: har.Creator{Name: "lebedev", Version: "1.3"}}); err != nil {
 		r.printf("save: %v", err)
 		return
 	}
@@ -193,16 +198,46 @@ func (r *REPL) cmdSave(ctx context.Context) {
 	r.printf("saved session %q to the durable store (%d entries)", id, len(stored))
 }
 
-func (r *REPL) cmdStop() {
-	if r.current == nil || !r.current.running {
-		r.printf("no active capture")
+func (r *REPL) cmdStop(args []string) {
+	if len(args) == 0 {
+		r.printf("stop: need a session id")
+		return
+	}
+	id := args[0]
+	if r.current == nil || r.current.id != id {
+		r.printf("no active capture %q", id)
+		return
+	}
+	if !r.current.running {
+		r.printf("capture %q is already stopped", id)
 		return
 	}
 	if err := r.current.stop(); err != nil {
 		r.printf("stop: %v", err)
 		return
 	}
-	r.printf("stopped capture %q (still queryable; export to keep it)", r.current.id)
+	r.printf("stopped capture %q (still queryable; 'resume %s' to continue, 'save' to keep it)", id, id)
+}
+
+func (r *REPL) cmdResume(args []string) {
+	if len(args) == 0 {
+		r.printf("resume: need a session id")
+		return
+	}
+	id := args[0]
+	if r.current == nil || r.current.id != id {
+		r.printf("no stopped capture %q to resume", id)
+		return
+	}
+	if r.current.running {
+		r.printf("capture %q is already running on %s", id, r.current.addr())
+		return
+	}
+	if err := r.current.resume(); err != nil {
+		r.printf("resume: %v", err)
+		return
+	}
+	r.printf("resumed capture %q on %s", id, r.current.addr())
 }
 
 func (r *REPL) cmdSessions(ctx context.Context) {
