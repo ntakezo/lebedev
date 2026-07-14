@@ -7,8 +7,8 @@ Lebedev is a lightweight man-in-the-middle proxy that **mirrors the client it
 intercepts**. Instead of re-originating traffic with its own fingerprint, it
 reconstructs the captured client's TLS ClientHello and HTTP/2 traits and replays
 them upstream, so the origin sees a connection that matches the real client —
-while every request and response is streamed out as structured, faithful data
-for inspection.
+while every request and response is recorded as structured, faithful data for
+inspection.
 
 It is built for debugging and analyzing HTTPS traffic where a generic proxy would
 be detected or would alter the very behavior you are trying to observe.
@@ -23,12 +23,19 @@ be detected or would alter the very behavior you are trying to observe.
   browser family and a graceful h2 fallback when QUIC is blocked.
 - **Faithful capture** — preserves header order, header casing, pseudo-header
   order, and body bytes across HTTP/1.1 and HTTP/2.
-- **Structured streaming** — one JSON record per transaction, to stdout or a file.
-- **Multi-session support** — tag and route traffic per session, optionally
-  through a per-session outbound proxy.
-- **Simple CA management** — generate a root CA and print OS-specific trust
-  instructions with one command.
-- **Small and dependency-light** — a single Go binary, no runtime services.
+- **SQL-backed store** — transactions are recorded into SQL (SQLite or
+  PostgreSQL) and queried on demand. The store round-trips every observation
+  verbatim — header and cookie order, whitespace, URLs, form fields, and bodies.
+- **Interactive REPL** — a single prompt to start captures and CRUD stored
+  sessions. Built for a developer at the keyboard and for an LLM driving it
+  through an MCP server.
+- **In-memory captures** — a capture's session lives in memory and is discarded
+  on exit; `save` it to the durable store (or export it to HAR) to keep it. The
+  durable store itself survives across runs.
+- **HAR 1.3 import/export** — sessions export as a standard HTTP Archive (HAR)
+  1.3 document and existing HAR files import back in. The raw TLS ClientHello and
+  HTTP/2 fingerprint ride along in a custom `_lebedev` field.
+- **Small and dependency-light** — a single Go binary (pure-Go SQLite, no CGo).
 
 ## How it works
 
@@ -42,7 +49,7 @@ be detected or would alter the very behavior you are trying to observe.
                           └──────────────────────────┘
                                       │
                                       ▼
-                            JSON Lines session data
+                     SQL store  ──▶  HAR 1.3 export / query
 ```
 
 1. A client is configured to use Lebedev as its HTTPS proxy and issues `CONNECT`.
@@ -53,7 +60,7 @@ be detected or would alter the very behavior you are trying to observe.
 4. It forwards the request to the origin through an upstream client whose TLS and
    HTTP/2 fingerprint reproduce the captured client.
 5. The origin's response is returned to the client, and the full transaction is
-   emitted as a structured record.
+   recorded as a HAR entry — queryable and exportable on demand.
 
 ## Install
 
@@ -73,161 +80,170 @@ go build -o lebedev ./cmd/lebedev
 
 ## Quick start
 
-**1. Create and trust the root CA.** Lebedev must terminate TLS, so its root has
-to be trusted by the client machine. `cert` generates the CA (on first run) and
-prints the command to trust it:
+Running `lebedev` opens an interactive REPL. Startup ensures the root CA exists
+and opens the durable store (`~/.lebedev/store.db` by default).
 
 ```sh
-lebedev cert
+lebedev
+lebedev: durable store sqlite:~/.lebedev/store.db (CA: ~/.lebedev/ca.crt)
+lebedev: type 'help' for commands
+lebedev>
 ```
 
-On macOS, for example, it prints:
+**1. Trust the root CA.** Lebedev must terminate TLS, so its root has to be
+trusted by the client machine. `cert` prints the command to trust it:
 
-```sh
-sudo security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain ~/.lebedev/ca.crt
+```
+lebedev> cert
+CA certificate: ~/.lebedev/ca.crt
+
+Trust it (admin required):
+  sudo security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain ~/.lebedev/ca.crt
 ```
 
-**2. Start a proxy session:**
+**2. Start a capture.** `run` begins serving the proxy; the session's entries
+accumulate in memory:
 
-```sh
-lebedev run --addr :8080 --out session.jsonl --session my-app
+```
+lebedev> run my-app --addr :8080
+capturing session "my-app" on [::]:8080 — entries are in memory only ('save' to keep them)
 ```
 
 **3. Point a client at it.** Any client that speaks HTTP `CONNECT` works — set it
-as the HTTPS proxy. For a real browser fingerprint, configure the browser's proxy
-to `localhost:8080`. With curl:
+as the HTTPS proxy. With curl:
 
 ```sh
 curl -x http://localhost:8080 --cacert ~/.lebedev/ca.crt https://example.com/
 ```
 
-Or launch a fresh, isolated Chrome already pointed at the proxy — a clean profile
-with no cookies, history, or extensions, so the capture reflects a real browser's
-fingerprint:
-
-```sh
-lebedev browser
-```
-
-It opens `https://tls.peet.ws/api/all` by default so you can eyeball the JA3/JA4 the
-origin sees; pass `--url` for anything else. Closing Chrome discards the profile.
-
-Each request/response is written to `session.jsonl` as it completes.
-
-### Filtering what gets recorded
-
-By default every transaction is written. `--filter-url` and `--filter-type` narrow
-the output (capture and upstream mirroring are unaffected — only what reaches the
-sink changes). Both flags are repeatable; within a flag the matches are OR'd, and
-the two flags are AND'd together.
-
-```sh
-# only HTML documents
-lebedev run --filter-type html
-
-# only images and fonts from any fifa.com host
-lebedev run --filter-type image --filter-type font --filter-url '*fifa.com*'
-
-# only .json responses under /api/
-lebedev run --filter-url '*//*/api/*' --filter-type json
-```
-
-URL globs match the full `scheme://authority/target` with `*` matching any run of
-characters (including `/`), so `*//*/*` matches any absolute URL. Type values are
-friendly categories (`html`, `image`, `json`, `css`, `js`, `font`, `media`,
-`video`, `audio`, `xml`, `text`) or a raw MIME glob such as `image/*` or
-`text/html`; a response with no `Content-Type` never matches a `--filter-type`.
-
-## Usage
+Or launch a fresh, isolated Chrome already pointed at the active capture — a clean
+profile with no cookies, history, or extensions:
 
 ```
-lebedev run     [flags]   start a proxy session
-lebedev cert    [flags]   ensure the CA exists and print trust instructions
-lebedev browser [flags]   launch a fresh Chrome routed through the proxy
+lebedev> browser
 ```
 
-### `run` flags
+**4. Keep it, or let it go.** The session vanishes when you quit. To keep it,
+`save` it to the durable store — or export it to a HAR file:
 
-| Flag              | Default            | Description                                            |
-| ----------------- | ------------------ | ------------------------------------------------------ |
-| `--addr`          | `:8080`            | Listen address for the HTTP `CONNECT` proxy.           |
-| `--out`           | `-`                | Session output: `-` for stdout, or a file path.        |
-| `--session`       | `default`          | Session id recorded on each transaction.               |
-| `--upstream-proxy`| _(none)_           | Outbound proxy URL for origin traffic, e.g. `http://host:port`. |
-| `--filter-url`    | _(none)_           | Only record request URLs matching this glob (`*` matches any chars, including `/`). Repeatable. |
-| `--filter-type`   | _(none)_           | Only record responses of this content type. Repeatable. |
-| `--ca-cert`       | `~/.lebedev/ca.crt`| Path to the root CA certificate.                       |
-| `--ca-key`        | `~/.lebedev/ca.key`| Path to the root CA private key.                       |
+```
+lebedev> save
+saved session "my-app" to the durable store (12 entries)
+lebedev> export my-app my-app.har
+```
 
-### `cert` flags
+## The REPL
 
-| Flag        | Default             | Description                       |
-| ----------- | ------------------- | --------------------------------- |
-| `--ca-cert` | `~/.lebedev/ca.crt` | Path to the root CA certificate.  |
-| `--ca-key`  | `~/.lebedev/ca.key` | Path to the root CA private key.  |
+The durable store (the "system state") is opened for the life of the process and
+survives across runs. A capture's session, by contrast, lives in memory and is
+discarded on exit; to keep it, `save` it to the durable store (or `export` it to a
+HAR file). Re-running `save` overwrites the stored copy, so it snapshots the
+growing session without duplicating entries.
+
+```
+run [id] [--addr :8080] [--upstream-proxy URL]
+                       start a capture; entries stay in memory only
+save                   write the live session to the durable store
+stop                   stop the active capture (its session stays queryable)
+sessions | ls          list stored sessions (and the live one, if any)
+show <id> [limit]      list a session's entries
+export <id> [file]     write a session as HAR 1.3 (stdout if no file)
+import <file> [as id]  load a HAR 1.3 document into the durable store
+rename <old> <new>     rename a stored session
+rm <id>                delete a stored session
+cert                   print CA trust instructions
+browser [url]          launch a fresh Chrome through the active capture
+help | quit
+```
+
+`run` takes an optional session id (default `default`), the listen address, and
+an optional per-session outbound proxy. `save` writes the active capture to the
+durable store; `show`, `export`, and `sessions` operate on the live in-memory
+session when the id names the active capture, and on the durable store otherwise.
+
+### Global flags
+
+| Flag        | Default                   | Description                                            |
+| ----------- | ------------------------- | ------------------------------------------------------ |
+| `--db`      | `sqlite:~/.lebedev/store.db` | Durable store DSN: `sqlite:PATH` or `postgres://…`. |
+| `--ca-cert` | `~/.lebedev/ca.crt`       | Path to the root CA certificate.                       |
+| `--ca-key`  | `~/.lebedev/ca.key`       | Path to the root CA private key.                       |
 
 The CA is generated on first use and reused thereafter. Keep `ca.key` private; it
 can mint a trusted certificate for any host.
 
-### `browser` flags
+## Storage and HAR format
 
-| Flag                 | Default                        | Description                                             |
-| -------------------- | ------------------------------ | ------------------------------------------------------- |
-| `--proxy`            | `http://127.0.0.1:8080`        | Lebedev proxy URL Chrome routes through.                |
-| `--url`              | `https://tls.peet.ws/api/all`  | Initial URL to open.                                    |
-| `--chrome`           | _(auto-detected)_              | Path to the Chrome binary; overrides autodetection.     |
-| `--user-data-dir`    | _(fresh temp dir)_             | Chrome profile directory; a temp profile is used and removed on exit when empty. |
-| `--ignore-cert-errors`| `false`                       | Ignore TLS cert errors instead of trusting the CA.      |
+Transactions are recorded into a SQL store — SQLite by default (`~/.lebedev/store.db`),
+or PostgreSQL via `--db postgres://…`. A capture's live session is held in an
+in-memory SQLite database and reaches the durable store when you `save` it (or
+export it to HAR and import it back). The relational schema is queryable directly, and the store round-trips
+every observation verbatim; any transformation an observation needs to fit HAR
+(deriving a status text, base64-encoding a binary body) is done before the store
+sees it, so the SQL layer never alters the bytes it is handed.
 
-Chrome is found via `--chrome`, then the `LEBEDEV_CHROME` environment variable,
-then `PATH`, then the platform's default install locations. Because Chrome must
-trust the proxy's leaf certificates, either trust the CA first (`lebedev cert`) or
-pass `--ignore-cert-errors` for a throwaway run. On macOS, trusting the CA in the
-System keychain covers Chrome; on Linux, Chrome uses its own NSS store, so
-`--ignore-cert-errors` is the simplest path.
-
-## Session output format
-
-Sessions are emitted as [JSON Lines](https://jsonlines.org/) — one record per
-completed transaction. The `http2` object is present only for HTTP/2 connections;
-`clientHelloHex` is the raw ClientHello record, hex-encoded. The response's
-`proto` field is present only when the upstream protocol differs from the client's
-request protocol — that is, when the mirror upgraded the origin to `HTTP/3.0`.
-Bodies are the raw bytes as sent on the wire (not decompressed), carried as a
-JSON string.
+Import and export use [HAR 1.3](http://www.softwareishard.com/blog/har-12-spec/),
+the standard HTTP Archive format most browser devtools and proxies understand.
+Lebedev-specific data that HAR has no home for — the session id, the raw TLS
+ClientHello, the upstream protocol actually spoken, and the HTTP/2 fingerprint —
+rides along in the custom, underscore-prefixed `_lebedev` field the HAR spec
+reserves for tool extensions. Response bodies are HAR `content` (base64-encoded
+with `"encoding": "base64"` when not valid UTF-8), so binary responses survive a
+round trip byte-for-byte.
 
 ```json
 {
-  "session": "my-app",
-  "protocol": "HTTP/2.0",
-  "tls": { "clientHelloHex": "1603010200010001fc0303..." },
-  "request": {
-    "method": "GET",
-    "target": "/",
-    "scheme": "https",
-    "authority": "example.com",
-    "proto": "HTTP/2.0",
-    "headers": [
-      { "name": "user-agent", "value": "Mozilla/5.0" },
-      { "name": "accept", "value": "text/html" }
+  "log": {
+    "version": "1.3",
+    "creator": { "name": "lebedev", "version": "1.3" },
+    "entries": [
+      {
+        "startedDateTime": "2026-07-13T00:00:00.000Z",
+        "time": 0,
+        "request": {
+          "method": "GET",
+          "url": "https://example.com/",
+          "httpVersion": "HTTP/2.0",
+          "cookies": [],
+          "headers": [
+            { "name": "user-agent", "value": "Mozilla/5.0" },
+            { "name": "accept", "value": "text/html" }
+          ],
+          "queryString": [],
+          "headersSize": -1,
+          "bodySize": 0
+        },
+        "response": {
+          "status": 200,
+          "statusText": "OK",
+          "httpVersion": "HTTP/2.0",
+          "cookies": [],
+          "headers": [{ "name": "content-type", "value": "text/html" }],
+          "content": { "size": 559, "mimeType": "text/html", "text": "<!doctype html>..." },
+          "redirectURL": "",
+          "headersSize": -1,
+          "bodySize": 559
+        },
+        "cache": {},
+        "timings": { "send": 0, "wait": 0, "receive": 0 },
+        "_lebedev": {
+          "session": "my-app",
+          "clientHelloHex": "1603010200010001fc0303...",
+          "http2": {
+            "settings": [{ "id": 1, "value": 65536 }, { "id": 4, "value": 6291456 }],
+            "connectionFlow": 15663105,
+            "pseudoOrder": [":method", ":authority", ":scheme", ":path"],
+            "headerOrder": ["user-agent", "accept"]
+          }
+        }
+      }
     ]
-  },
-  "response": {
-    "status": 200,
-    "headers": [{ "name": "content-type", "value": "text/html" }],
-    "body": "<!doctype html>..."
-  },
-  "http2": {
-    "settings": [
-      { "id": 1, "value": 65536 },
-      { "id": 4, "value": 6291456 }
-    ],
-    "connectionFlow": 15663105,
-    "pseudoOrder": [":method", ":authority", ":scheme", ":path"],
-    "headerOrder": ["user-agent", "accept"]
   }
 }
 ```
+
+An upstream HTTP/3 upgrade shows up as `response.httpVersion` of `HTTP/3.0` and a
+matching `_lebedev.upstreamProto`; for h2/h1 the field is omitted.
 
 ## Fidelity and detection surface
 
@@ -284,7 +300,9 @@ The codebase is organized under `internal/`:
 | `proxy`    | MITM core: `CONNECT`, TLS termination, and upstream dispatch.        |
 | `capture`  | Faithful HTTP/1.1 and HTTP/2 request parsing and fingerprinting.     |
 | `upstream` | Fingerprint-mirroring client that replays requests to the origin.    |
-| `session`  | Ties a proxy run to a serialized session data stream.                |
+| `session`  | Turns each transaction into a HAR entry and hands it to a recorder.  |
+| `store`    | SQL-backed persistence (SQLite/PostgreSQL) with HAR 1.3 import/export and querying. |
+| `repl`     | Interactive control surface: captures, saving to the store, and session CRUD. |
 
 ## Security and legal
 

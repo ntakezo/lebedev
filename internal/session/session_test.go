@@ -1,18 +1,17 @@
 package session
 
 import (
-	"bytes"
-	"encoding/json"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/ntakezo/lebedev/internal/capture"
 	"github.com/ntakezo/lebedev/internal/proxy"
 )
 
-func TestSinkEmitsFaithfulJSONLine(t *testing.T) {
+func TestEntryFromTransactionIsFaithful(t *testing.T) {
 	req, err := capture.Read(strings.NewReader(
-		"POST /submit HTTP/1.1\r\nHost: example.com\r\nContent-Length: 3\r\n\r\nabc"))
+		"POST /submit?q=hi&n=1 HTTP/1.1\r\nHost: example.com\r\nContent-Type: text/plain\r\nContent-Length: 3\r\n\r\nabc"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -27,70 +26,72 @@ func TestSinkEmitsFaithfulJSONLine(t *testing.T) {
 		},
 	}
 
-	var buf bytes.Buffer
-	sink := NewSink(&buf)
-	if err := sink.Emit(toRecord("s1", tx)); err != nil {
-		t.Fatal(err)
-	}
-	if err := sink.Emit(toRecord("s1", tx)); err != nil {
-		t.Fatal(err)
-	}
+	e := entryFromTransaction("s1", tx, time.Unix(0, 0).UTC())
 
-	lines := strings.Split(strings.TrimRight(buf.String(), "\n"), "\n")
-	if len(lines) != 2 {
-		t.Fatalf("expected 2 JSON lines, got %d", len(lines))
+	if e.Request.Method != "POST" || e.Request.URL != "https://example.com/submit?q=hi&n=1" {
+		t.Errorf("request line = %q %q", e.Request.Method, e.Request.URL)
 	}
-
-	var rec Record
-	if err := json.Unmarshal([]byte(lines[0]), &rec); err != nil {
-		t.Fatalf("record is not valid JSON: %v", err)
+	if e.Request.HTTPVersion != "HTTP/1.1" {
+		t.Errorf("httpVersion = %q", e.Request.HTTPVersion)
 	}
-	if rec.Session != "s1" || rec.Protocol != "HTTP/1.1" {
-		t.Errorf("session/protocol = %q %q", rec.Session, rec.Protocol)
+	if len(e.Request.QueryString) != 2 || e.Request.QueryString[0].Name != "q" || e.Request.QueryString[1].Value != "1" {
+		t.Errorf("queryString = %+v", e.Request.QueryString)
 	}
-	if rec.Request.Method != "POST" || rec.Request.Target != "/submit" || rec.Request.Authority != "example.com" {
-		t.Errorf("request = %+v", rec.Request)
+	if e.Request.PostData == nil || e.Request.PostData.Text != "abc" || e.Request.PostData.MimeType != "text/plain" {
+		t.Errorf("postData = %+v", e.Request.PostData)
 	}
-	if rec.Request.Body != "abc" {
-		t.Errorf("request body = %q", rec.Request.Body)
+	if e.Response.Status != 200 || e.Response.StatusText != "OK" {
+		t.Errorf("response status = %d %q", e.Response.Status, e.Response.StatusText)
 	}
-	if rec.Response.Status != 200 || rec.Response.Body != "ok" {
-		t.Errorf("response = %+v", rec.Response)
+	if e.Response.Content.Text != "ok" || e.Response.Content.MimeType != "text/plain" || e.Response.Content.Size != 2 {
+		t.Errorf("content = %+v", e.Response.Content)
 	}
-	if rec.TLS.ClientHelloHex != "1603010001ff" {
-		t.Errorf("clientHelloHex = %q", rec.TLS.ClientHelloHex)
+	if e.Lebedev == nil || e.Lebedev.ClientHelloHex != "1603010001ff" || e.Lebedev.Session != "s1" {
+		t.Errorf("lebedev = %+v", e.Lebedev)
 	}
-	if rec.HTTP2 != nil {
-		t.Errorf("h1 record should not carry http2 details: %+v", rec.HTTP2)
+	if e.Lebedev.HTTP2 != nil {
+		t.Errorf("h1 entry should carry no http2 fingerprint: %+v", e.Lebedev.HTTP2)
 	}
-	// Upstream spoke the same protocol as the client, so proto is omitted.
-	if rec.Response.Proto != "" {
-		t.Errorf("response proto should be empty when it matches the client: %q", rec.Response.Proto)
+	if e.Lebedev.UpstreamProto != "" {
+		t.Errorf("upstream proto should be empty when it matches the client: %q", e.Lebedev.UpstreamProto)
 	}
 }
 
-// TestRecordSurfacesUpstreamHTTP3 asserts that when the mirror upgrades the origin
-// to HTTP/3, the record surfaces the diverging upstream protocol, and that a
-// matching upstream protocol stays omitted.
-func TestRecordSurfacesUpstreamHTTP3(t *testing.T) {
+func TestEntryBinaryBodyIsBase64(t *testing.T) {
 	req, err := capture.Read(strings.NewReader("GET / HTTP/1.1\r\nHost: example.com\r\n\r\n"))
 	if err != nil {
 		t.Fatal(err)
 	}
+	binary := []byte{0x00, 0xff, 0xfe, 0x80}
+	e := entryFromTransaction("s1", proxy.Transaction{
+		Request:  req,
+		Response: capture.Response{Status: 200, Body: binary},
+	}, time.Unix(0, 0).UTC())
 
-	upgraded := toRecord("s1", proxy.Transaction{
+	if e.Response.Content.Encoding != "base64" {
+		t.Fatalf("non-UTF-8 body should be base64-flagged, got encoding %q", e.Response.Content.Encoding)
+	}
+	if e.Response.Content.Text != "AP/+gA==" {
+		t.Errorf("base64 text = %q", e.Response.Content.Text)
+	}
+}
+
+// TestEntrySurfacesUpstreamHTTP3 asserts that an upstream HTTP/3 upgrade is
+// surfaced on the custom _lebedev field while the client-facing httpVersion
+// reflects the actual protocol spoken.
+func TestEntrySurfacesUpstreamHTTP3(t *testing.T) {
+	req, err := capture.Read(strings.NewReader("GET / HTTP/1.1\r\nHost: example.com\r\n\r\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	e := entryFromTransaction("s1", proxy.Transaction{
 		Request:  req,
 		Response: capture.Response{Status: 200, Proto: "HTTP/3.0"},
-	})
-	if upgraded.Response.Proto != "HTTP/3.0" {
-		t.Errorf("upgraded response proto = %q, want HTTP/3.0", upgraded.Response.Proto)
+	}, time.Unix(0, 0).UTC())
+	if e.Lebedev.UpstreamProto != "HTTP/3.0" {
+		t.Errorf("upstream proto = %q, want HTTP/3.0", e.Lebedev.UpstreamProto)
 	}
-
-	same := toRecord("s1", proxy.Transaction{
-		Request:  req,
-		Response: capture.Response{Status: 200, Proto: "HTTP/1.1"},
-	})
-	if same.Response.Proto != "" {
-		t.Errorf("matching upstream proto should be omitted, got %q", same.Response.Proto)
+	if e.Response.HTTPVersion != "HTTP/3.0" {
+		t.Errorf("response httpVersion = %q, want HTTP/3.0", e.Response.HTTPVersion)
 	}
 }
