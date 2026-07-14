@@ -1,0 +1,24 @@
+# Binaries
+/lebedev
+/bin/
+*.exe
+*.test
+
+# Coverage and profiling
+*.out
+*.prof
+coverage.html
+
+# Env / secrets
+.env
+.env.*
+*.pem
+*.key
+
+# Editor / OS
+.idea/
+.vscode/
+.DS_Store
+
+# Claude Code local settings
+.claude/settings.local.json
