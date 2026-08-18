@@ -6,20 +6,27 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/ntakezo/lebedev/internal/store"
+	"github.com/ntakezo/lebedev/repository"
+	"github.com/ntakezo/lebedev/repository/sqlite"
 )
 
 // TestReplSessionCRUD drives the pure store-management commands (no proxy) and
 // checks that list, rename, and delete take effect and are reported.
 func TestReplSessionCRUD(t *testing.T) {
-	durable, err := store.Open("")
+	durable, err := sqlite.Open("")
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer durable.Close()
 	ctx := context.Background()
-	durable.Insert(ctx, "alpha", testEntry("https://a/1"), 1)
-	durable.Insert(ctx, "alpha", testEntry("https://a/2"), 2)
+	if _, err := durable.CreateSession(ctx, repository.Session{Name: "alpha"}); err != nil {
+		t.Fatal(err)
+	}
+	for _, url := range []string{"https://a/1", "https://a/2"} {
+		if _, err := durable.CreateEntry(ctx, "alpha", 0, testEntry(url)); err != nil {
+			t.Fatal(err)
+		}
+	}
 
 	var out bytes.Buffer
 	r := New(durable, nil, "/tmp/ca.crt", &out)

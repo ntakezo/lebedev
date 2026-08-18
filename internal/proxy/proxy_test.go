@@ -21,23 +21,21 @@ import (
 	"github.com/ntakezo/lebedev/internal/capture"
 )
 
-// stubDialer records what the proxy captured and returns a canned response,
-// standing in for the real fingerprint-mirroring upstream so the proxy can be
-// exercised without touching the network.
+// stubDialer records what the proxy asked for and returns a canned response,
+// standing in for the real upstream client so the proxy can be exercised without
+// touching the network.
 type stubDialer struct{ rt *stubRT }
 
-func (d stubDialer) forConn(rawHello []byte, fp capture.HTTP2Fingerprint, h2 bool) (roundTripper, error) {
-	d.rt.hello = rawHello
+func (d stubDialer) forConn(h2 bool) (roundTripper, error) {
 	d.rt.h2 = h2
 	return d.rt, nil
 }
 
 type stubRT struct {
-	mu    sync.Mutex
-	reqs  []capture.Request
-	hello []byte
-	h2    bool
-	resp  capture.Response
+	mu   sync.Mutex
+	reqs []capture.Request
+	h2   bool
+	resp capture.Response
 }
 
 func (r *stubRT) RoundTrip(req capture.Request) (capture.Response, error) {
@@ -84,14 +82,19 @@ func TestProxyH1EndToEnd(t *testing.T) {
 	if rt.h2 {
 		t.Error("expected h1 forwarding")
 	}
-	if len(rt.hello) == 0 || rt.hello[0] != 0x16 {
-		t.Errorf("raw ClientHello not captured: %v", rt.hello[:min(4, len(rt.hello))])
-	}
 
 	select {
 	case tx := <-txs:
 		if tx.Request.Target() != "/path" || string(tx.Response.Body) != "hello" {
 			t.Errorf("observed transaction = %q %q", tx.Request.Target(), tx.Response.Body)
+		}
+		// The fingerprint now travels on the transaction's connection, which is
+		// what lets a recorder store it once per connection.
+		if tx.Conn.ID == 0 {
+			t.Error("transaction carries no connection id")
+		}
+		if len(tx.Conn.ClientHello) == 0 || tx.Conn.ClientHello[0] != 0x16 {
+			t.Errorf("raw ClientHello not captured: %v", tx.Conn.ClientHello[:min(4, len(tx.Conn.ClientHello))])
 		}
 	case <-time.After(time.Second):
 		t.Error("OnTransaction never fired")
@@ -231,17 +234,12 @@ func caPool(t *testing.T, a *ca.Authority) *x509.CertPool {
 	return pool
 }
 
-func TestDialerForSelectsUpstreamClient(t *testing.T) {
-	for _, tc := range []struct {
-		fp   Fingerprint
-		want dialer
-	}{
-		{MirrorClient, mirrorDialer{proxyURL: "http://p"}},
-		{StockChrome, stockChromeDialer{proxyURL: "http://p"}},
-		{"", stockChromeDialer{proxyURL: "http://p"}},
-	} {
-		if got := dialerFor(tc.fp, "http://p"); got != tc.want {
-			t.Errorf("dialerFor(%q) = %#v, want %#v", tc.fp, got, tc.want)
-		}
+// Connection ids must be distinct per accepted connection and stable within one,
+// since a recorder keys the stored fingerprint on them.
+func TestConnectionIDsAreDistinctPerConnection(t *testing.T) {
+	s := &Server{}
+	first, second := s.conns.Add(1), s.conns.Add(1)
+	if first == second || first == 0 {
+		t.Errorf("connection ids = %d, %d, want distinct non-zero", first, second)
 	}
 }

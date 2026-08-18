@@ -40,6 +40,9 @@ type Repository interface {
 	// CreateSession records a new session and returns its id. It returns ErrExists
 	// when the name is already taken.
 	CreateSession(ctx context.Context, s Session) (int64, error)
+	// Sessions lists every stored session with its entry and connection counts,
+	// ordered by name. It is the only read that spans sessions.
+	Sessions(ctx context.Context) ([]SessionInfo, error)
 	// Session returns one session with its log metadata, its connections, and a
 	// summary of each entry in capture order. Entry bodies are not loaded; fetch a
 	// full entry with Entry. It returns ErrNotFound when name is unknown.
@@ -79,6 +82,16 @@ type Repository interface {
 type Session struct {
 	Name string
 	Log  model.Log
+}
+
+// SessionInfo summarizes one stored session for listing, without reading any of
+// its rows.
+type SessionInfo struct {
+	ID          int64
+	Name        string
+	CreatedAt   time.Time
+	Entries     int
+	Connections int
 }
 
 // SessionDetails is one stored session read back: its identity, the log metadata

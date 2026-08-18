@@ -9,7 +9,7 @@ import (
 	"bufio"
 	"crypto/tls"
 	"net"
-	"sync"
+	"sync/atomic"
 
 	"github.com/ntakezo/lebedev/internal/ca"
 	"github.com/ntakezo/lebedev/internal/capture"
@@ -21,83 +21,65 @@ type roundTripper interface {
 	RoundTrip(capture.Request) (capture.Response, error)
 }
 
-// dialer builds a per-connection round tripper from the captured client
-// fingerprint: the raw ClientHello, the h2 traits, and whether the client used
-// h2. It is an interface so tests can forward without touching the network.
+// dialer builds a per-connection round tripper. h2 selects the origin-facing
+// protocol so an h1 client is forwarded over h1. It is an interface so tests can
+// forward without touching the network.
 type dialer interface {
-	forConn(rawHello []byte, fp capture.HTTP2Fingerprint, h2 bool) (roundTripper, error)
+	forConn(h2 bool) (roundTripper, error)
 }
 
-type mirrorDialer struct{ proxyURL string }
-
-func (d mirrorDialer) forConn(rawHello []byte, fp capture.HTTP2Fingerprint, h2 bool) (roundTripper, error) {
-	return upstream.NewMirror(rawHello, fp, h2, d.proxyURL)
-}
-
-// stockChromeDialer ignores the captured fingerprint and sends every request
-// with the stock latest-Chrome profile instead.
+// stockChromeDialer sends every request with the stock latest-Chrome profile.
 type stockChromeDialer struct{ proxyURL string }
 
-func (d stockChromeDialer) forConn(_ []byte, _ capture.HTTP2Fingerprint, h2 bool) (roundTripper, error) {
+func (d stockChromeDialer) forConn(h2 bool) (roundTripper, error) {
 	return upstream.NewStockChrome(h2, d.proxyURL)
 }
 
-// Transaction is one captured request together with the response returned to
-// the client and the client fingerprint it was served under. H2 is the zero
-// value for HTTP/1.1 connections.
-type Transaction struct {
+// Conn identifies one client TLS connection and the fingerprint it was observed
+// under. Every transaction multiplexed on that connection carries the same
+// value, so a recorder can store the fingerprint once instead of per request.
+// H2 is the zero value for HTTP/1.1 connections.
+type Conn struct {
+	ID          int64
 	ClientHello []byte
 	H2          capture.HTTP2Fingerprint
-	Request     capture.Request
-	Response    capture.Response
 }
 
-// Fingerprint names which fingerprint origin traffic is sent with.
-type Fingerprint string
-
-const (
-	// MirrorClient reproduces the captured client's ClientHello and h2 traits.
-	MirrorClient Fingerprint = "mirror"
-	// StockChrome sends every request with tls-client's latest Chrome profile,
-	// discarding the captured fingerprint.
-	StockChrome Fingerprint = "chrome"
-)
+// Transaction is one captured request together with the response returned to
+// the client and the connection it was observed on.
+type Transaction struct {
+	Conn     Conn
+	Request  capture.Request
+	Response capture.Response
+}
 
 // Options configures a Server. OutboundProxy, when set, routes all origin
-// traffic through that proxy. Fingerprint selects the upstream fingerprint and
-// defaults to StockChrome when empty. OnTransaction, when set, is called once
-// per completed request/response for streaming or logging.
+// traffic through that proxy. OnTransaction, when set, is called once per
+// completed request/response for streaming or logging.
 type Options struct {
 	OutboundProxy string
-	Fingerprint   Fingerprint
 	OnTransaction func(Transaction)
 }
 
-// Server terminates client TLS with authority's leaves and mirrors each client
+// Server terminates client TLS with authority's leaves and forwards each request
 // upstream. The zero value is not usable; construct one with New.
 type Server struct {
 	authority *ca.Authority
 	dialer    dialer
 	onTx      func(Transaction)
+	// conns numbers accepted client connections, so the transactions multiplexed
+	// on one connection can be tied back to it.
+	conns atomic.Int64
 }
 
-// New returns a proxy that mints leaves from authority and forwards through the
-// upstream client opts.Fingerprint selects, honoring the rest of opts.
+// New returns a proxy that mints leaves from authority and forwards through a
+// stock-Chrome upstream client, honoring opts.
 func New(authority *ca.Authority, opts Options) *Server {
 	return &Server{
 		authority: authority,
-		dialer:    dialerFor(opts.Fingerprint, opts.OutboundProxy),
+		dialer:    stockChromeDialer{proxyURL: opts.OutboundProxy},
 		onTx:      opts.OnTransaction,
 	}
-}
-
-// dialerFor picks the upstream dialer for a fingerprint mode, treating anything
-// but an explicit MirrorClient as the stock-Chrome default.
-func dialerFor(fp Fingerprint, proxyURL string) dialer {
-	if fp == MirrorClient {
-		return mirrorDialer{proxyURL: proxyURL}
-	}
-	return stockChromeDialer{proxyURL: proxyURL}
 }
 
 func (s *Server) emit(tx Transaction) {
@@ -135,11 +117,12 @@ func (s *Server) handle(conn net.Conn) {
 	}
 	defer tlsConn.Close()
 
+	client := Conn{ID: s.conns.Add(1), ClientHello: rawHello}
 	if tlsConn.ConnectionState().NegotiatedProtocol == "h2" {
-		s.serveH2(tlsConn, rawHello)
+		s.serveH2(tlsConn, client)
 		return
 	}
-	s.serveH1(tlsConn, rawHello)
+	s.serveH1(tlsConn, client)
 }
 
 // terminate peeks the ClientHello (returning its raw bytes for fingerprinting),
@@ -170,8 +153,8 @@ func (s *Server) terminate(br *bufio.Reader, conn net.Conn, connectHost string) 
 	return rawHello, tlsConn, nil
 }
 
-func (s *Server) serveH1(conn net.Conn, rawHello []byte) {
-	rt, err := s.dialer.forConn(rawHello, capture.HTTP2Fingerprint{}, false)
+func (s *Server) serveH1(conn net.Conn, c Conn) {
+	rt, err := s.dialer.forConn(false)
 	if err != nil {
 		return
 	}
@@ -185,33 +168,30 @@ func (s *Server) serveH1(conn net.Conn, rawHello []byte) {
 		if err != nil {
 			resp = errorResponse(err)
 		}
-		s.emit(Transaction{ClientHello: rawHello, Request: req, Response: resp})
+		s.emit(Transaction{Conn: c, Request: req, Response: resp})
 		if err := writeH1Response(conn, resp); err != nil {
 			return
 		}
 	}
 }
 
-// serveH2 builds the upstream round tripper lazily on the first request, once
-// the connection fingerprint is complete. ServeHTTP2 runs each stream's handler
-// concurrently, so the build is guarded by a sync.Once and the resulting client
-// (safe for concurrent use) is shared across streams.
-func (s *Server) serveH2(conn net.Conn, rawHello []byte) {
-	var (
-		once     sync.Once
-		rt       roundTripper
-		buildErr error
-	)
+// serveH2 forwards every stream on an h2 connection through one upstream client,
+// which is safe for concurrent use. The client no longer depends on the
+// connection fingerprint, so it is built up front; the fingerprint each stream
+// observed still rides along on the emitted transaction.
+func (s *Server) serveH2(conn net.Conn, c Conn) {
+	rt, err := s.dialer.forConn(true)
+	if err != nil {
+		return
+	}
 	capture.ServeHTTP2(conn, func(req capture.Request, fp capture.HTTP2Fingerprint) (capture.Response, error) {
-		once.Do(func() { rt, buildErr = s.dialer.forConn(rawHello, fp, true) })
-		if buildErr != nil {
-			return errorResponse(buildErr), nil
-		}
 		resp, err := rt.RoundTrip(req)
 		if err != nil {
 			resp = errorResponse(err)
 		}
-		s.emit(Transaction{ClientHello: rawHello, H2: fp, Request: req, Response: resp})
+		observed := c
+		observed.H2 = fp
+		s.emit(Transaction{Conn: observed, Request: req, Response: resp})
 		return resp, nil
 	})
 }

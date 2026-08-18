@@ -6,9 +6,9 @@ import (
 
 	"github.com/ntakezo/lebedev/har"
 	"github.com/ntakezo/lebedev/internal/ca"
-	"github.com/ntakezo/lebedev/internal/proxy"
-	"github.com/ntakezo/lebedev/internal/store"
 	"github.com/ntakezo/lebedev/model"
+	"github.com/ntakezo/lebedev/repository"
+	"github.com/ntakezo/lebedev/repository/sqlite"
 )
 
 func testEntry(url string) model.Entry {
@@ -21,27 +21,38 @@ func testEntry(url string) model.Entry {
 	}
 }
 
-// newTestCapture builds a capture wired to an in-memory store without starting a
-// proxy, so its recording behaviour can be exercised directly.
-func newTestCapture(t *testing.T) *capture {
+// openRepo builds an in-memory repository holding one empty session.
+func openRepo(t *testing.T, session string) *sqlite.Repository {
 	t.Helper()
-	mem, err := store.Open("")
+	repo, err := sqlite.Open("")
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { mem.Close() })
-	return &capture{id: "s1", mem: mem}
+	t.Cleanup(func() { repo.Close() })
+	if _, err := repo.CreateSession(context.Background(), repository.Session{Name: session}); err != nil {
+		t.Fatal(err)
+	}
+	return repo
 }
 
-// TestCaptureInsert verifies that inserted entries land in the in-memory store.
-func TestCaptureInsert(t *testing.T) {
+// newTestCapture builds a capture wired to an in-memory repository without
+// starting a proxy, so its recording behaviour can be exercised directly.
+func newTestCapture(t *testing.T) *capture {
+	t.Helper()
+	return &capture{id: "s1", mem: openRepo(t, "s1")}
+}
+
+func TestCaptureCountsRecordedEntries(t *testing.T) {
 	ctx := context.Background()
 	c := newTestCapture(t)
 
-	c.Insert(ctx, "s1", testEntry("https://a/1"), 1)
-	c.Insert(ctx, "s1", testEntry("https://a/2"), 2)
+	for _, url := range []string{"https://a/1", "https://a/2"} {
+		if _, err := c.mem.CreateEntry(ctx, "s1", 0, testEntry(url)); err != nil {
+			t.Fatal(err)
+		}
+	}
 
-	n, err := c.mem.Count(ctx, store.Query{Session: "s1"})
+	n, err := c.count(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -50,40 +61,64 @@ func TestCaptureInsert(t *testing.T) {
 	}
 }
 
-// TestSave verifies that save copies the live session's in-memory entries to the
-// durable store and that re-saving overwrites rather than duplicates.
+// TestSave verifies that save copies the live session to the durable repository,
+// that re-saving overwrites rather than duplicates, and that entries sharing a
+// connection still share one after the copy.
 func TestSave(t *testing.T) {
 	ctx := context.Background()
-	durable, err := store.Open("")
+	durable, err := sqlite.Open("")
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer durable.Close()
 
 	c := newTestCapture(t)
-	r := New(durable, nil, "", nil)
-	r.out = discard{}
+	r := New(durable, nil, "", discard{})
 	r.current = c
 
 	// Nothing captured yet — durable stays empty.
 	r.cmdSave(ctx)
-	if got, _ := durable.Count(ctx, store.Query{Session: "s1"}); got != 0 {
-		t.Fatalf("durable count before capture = %d, want 0", got)
+	if _, err := durable.Session(ctx, "s1"); err == nil {
+		t.Fatal("durable should hold nothing before anything is captured")
 	}
 
-	// Capture two entries, then save.
-	c.Insert(ctx, "s1", testEntry("https://a/1"), 1)
-	c.Insert(ctx, "s1", testEntry("https://a/2"), 2)
+	conn, err := c.mem.CreateConnection(ctx, "s1", model.Connection{ClientHelloHex: "1603"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, url := range []string{"https://a/1", "https://a/2"} {
+		if _, err := c.mem.CreateEntry(ctx, "s1", conn, testEntry(url)); err != nil {
+			t.Fatal(err)
+		}
+	}
 	r.cmdSave(ctx)
-	if got, _ := durable.Count(ctx, store.Query{Session: "s1"}); got != 2 {
-		t.Fatalf("durable count after save = %d, want 2", got)
+	d, err := durable.Session(ctx, "s1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(d.Entries) != 2 {
+		t.Fatalf("durable entries after save = %d, want 2", len(d.Entries))
+	}
+	if len(d.Connections) != 1 {
+		t.Fatalf("durable connections after save = %d, want 1 (the shared connection)", len(d.Connections))
+	}
+	for _, e := range d.Entries {
+		if e.Connection != d.Connections[0].ID {
+			t.Errorf("copied entry %d lost its connection", e.ID)
+		}
 	}
 
 	// A third entry plus a re-save snapshots the whole session without duplicating.
-	c.Insert(ctx, "s1", testEntry("https://a/3"), 3)
+	if _, err := c.mem.CreateEntry(ctx, "s1", conn, testEntry("https://a/3")); err != nil {
+		t.Fatal(err)
+	}
 	r.cmdSave(ctx)
-	if got, _ := durable.Count(ctx, store.Query{Session: "s1"}); got != 3 {
-		t.Fatalf("durable count after re-save = %d, want 3 (overwrite, no dupes)", got)
+	d, err = durable.Session(ctx, "s1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(d.Entries) != 3 {
+		t.Fatalf("durable entries after re-save = %d, want 3 (overwrite, no dupes)", len(d.Entries))
 	}
 }
 
@@ -98,7 +133,7 @@ func TestStopResume(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	c, err := startCapture("s1", "127.0.0.1:0", "", proxy.MirrorClient, authority)
+	c, err := startCapture("s1", "127.0.0.1:0", "", authority)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -110,7 +145,9 @@ func TestStopResume(t *testing.T) {
 	addr := c.addr()
 
 	// An entry recorded before the pause must still be there afterward.
-	c.Insert(context.Background(), "s1", testEntry("https://a/1"), 1)
+	if _, err := c.mem.CreateEntry(context.Background(), "s1", 0, testEntry("https://a/1")); err != nil {
+		t.Fatal(err)
+	}
 
 	if err := c.stop(); err != nil {
 		t.Fatal(err)

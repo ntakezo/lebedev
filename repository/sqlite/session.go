@@ -57,6 +57,33 @@ func (r *Repository) CreateSession(ctx context.Context, s repository.Session) (i
 	return id, nil
 }
 
+// Sessions lists every stored session with its entry and connection counts,
+// ordered by name. The counts are aggregated in SQL, so listing a store with
+// large sessions reads no entry rows.
+func (r *Repository) Sessions(ctx context.Context) ([]repository.SessionInfo, error) {
+	rows, err := r.db.QueryContext(ctx, `SELECT s.id, s.name, s.created_at,
+		(SELECT COUNT(*) FROM entries e WHERE e.session_id = s.id),
+		(SELECT COUNT(*) FROM connections c WHERE c.session_id = s.id)
+		FROM sessions s ORDER BY s.name`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []repository.SessionInfo
+	for rows.Next() {
+		var (
+			si        repository.SessionInfo
+			createdAt int64
+		)
+		if err := rows.Scan(&si.ID, &si.Name, &createdAt, &si.Entries, &si.Connections); err != nil {
+			return nil, err
+		}
+		si.CreatedAt = time.UnixMilli(createdAt)
+		out = append(out, si)
+	}
+	return out, rows.Err()
+}
+
 // Session returns one session: its identity, log metadata, the TLS connections
 // its traffic was captured over, and a summary of every entry in capture order.
 // Entry bodies are left on disk — read one in full with Entry.

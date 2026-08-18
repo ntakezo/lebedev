@@ -1,12 +1,14 @@
 package session
 
 import (
+	"context"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/ntakezo/lebedev/internal/capture"
 	"github.com/ntakezo/lebedev/internal/proxy"
+	"github.com/ntakezo/lebedev/model"
 )
 
 func TestEntryFromTransactionIsFaithful(t *testing.T) {
@@ -17,8 +19,8 @@ func TestEntryFromTransactionIsFaithful(t *testing.T) {
 	}
 
 	tx := proxy.Transaction{
-		ClientHello: []byte{0x16, 0x03, 0x01, 0x00, 0x01, 0xff},
-		Request:     req,
+		Conn:    proxy.Conn{ID: 1, ClientHello: []byte{0x16, 0x03, 0x01, 0x00, 0x01, 0xff}},
+		Request: req,
 		Response: capture.Response{
 			Status:  200,
 			Headers: []capture.Header{{Name: "Content-Type", Value: "text/plain"}},
@@ -26,7 +28,7 @@ func TestEntryFromTransactionIsFaithful(t *testing.T) {
 		},
 	}
 
-	e := entryFromTransaction("s1", tx, time.Unix(0, 0).UTC())
+	e := entryFromTransaction(tx, time.Unix(0, 0).UTC())
 
 	if e.Request.Method != "POST" || e.Request.URL != "https://example.com/submit?q=hi&n=1" {
 		t.Errorf("request line = %q %q", e.Request.Method, e.Request.URL)
@@ -46,14 +48,20 @@ func TestEntryFromTransactionIsFaithful(t *testing.T) {
 	if e.Response.Content.Text != "ok" || e.Response.Content.MimeType != "text/plain" || e.Response.Content.Size != 2 {
 		t.Errorf("content = %+v", e.Response.Content)
 	}
-	if e.Lebedev == nil || e.Lebedev.ClientHelloHex != "1603010001ff" || e.Lebedev.Session != "s1" {
-		t.Errorf("lebedev = %+v", e.Lebedev)
+	// The fingerprint belongs to the connection, not the entry.
+	if e.Lebedev != nil {
+		t.Errorf("entry should carry no _lebedev field: %+v", e.Lebedev)
 	}
-	if e.Lebedev.HTTP2 != nil {
-		t.Errorf("h1 entry should carry no http2 fingerprint: %+v", e.Lebedev.HTTP2)
+
+	c := connectionFromTransaction("s1", tx)
+	if c.Session != "s1" || c.ClientHelloHex != "1603010001ff" {
+		t.Errorf("connection = %+v", c)
 	}
-	if e.Lebedev.UpstreamProto != "" {
-		t.Errorf("upstream proto should be empty when it matches the client: %q", e.Lebedev.UpstreamProto)
+	if c.HTTP2 != nil {
+		t.Errorf("h1 connection should carry no http2 fingerprint: %+v", c.HTTP2)
+	}
+	if c.UpstreamProto != "" {
+		t.Errorf("upstream proto should be empty when it matches the client: %q", c.UpstreamProto)
 	}
 }
 
@@ -63,7 +71,7 @@ func TestEntryBinaryBodyIsBase64(t *testing.T) {
 		t.Fatal(err)
 	}
 	binary := []byte{0x00, 0xff, 0xfe, 0x80}
-	e := entryFromTransaction("s1", proxy.Transaction{
+	e := entryFromTransaction(proxy.Transaction{
 		Request:  req,
 		Response: capture.Response{Status: 200, Body: binary},
 	}, time.Unix(0, 0).UTC())
@@ -76,22 +84,75 @@ func TestEntryBinaryBodyIsBase64(t *testing.T) {
 	}
 }
 
-// TestEntrySurfacesUpstreamHTTP3 asserts that an upstream HTTP/3 upgrade is
-// surfaced on the custom _lebedev field while the client-facing httpVersion
-// reflects the actual protocol spoken.
-func TestEntrySurfacesUpstreamHTTP3(t *testing.T) {
+// TestConnectionSurfacesDivergentUpstreamProto asserts that an upstream protocol
+// differing from the client's is recorded on the connection, while the entry's
+// client-facing httpVersion reflects the protocol actually spoken.
+func TestConnectionSurfacesDivergentUpstreamProto(t *testing.T) {
 	req, err := capture.Read(strings.NewReader("GET / HTTP/1.1\r\nHost: example.com\r\n\r\n"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	e := entryFromTransaction("s1", proxy.Transaction{
+	tx := proxy.Transaction{
 		Request:  req,
 		Response: capture.Response{Status: 200, Proto: "HTTP/3.0"},
-	}, time.Unix(0, 0).UTC())
-	if e.Lebedev.UpstreamProto != "HTTP/3.0" {
-		t.Errorf("upstream proto = %q, want HTTP/3.0", e.Lebedev.UpstreamProto)
 	}
-	if e.Response.HTTPVersion != "HTTP/3.0" {
-		t.Errorf("response httpVersion = %q, want HTTP/3.0", e.Response.HTTPVersion)
+	if got := connectionFromTransaction("s1", tx).UpstreamProto; got != "HTTP/3.0" {
+		t.Errorf("upstream proto = %q, want HTTP/3.0", got)
 	}
+	if got := entryFromTransaction(tx, time.Unix(0, 0).UTC()).Response.HTTPVersion; got != "HTTP/3.0" {
+		t.Errorf("response httpVersion = %q, want HTTP/3.0", got)
+	}
+}
+
+// TestRecordStoresOneConnectionPerClientConnection asserts the normalization the
+// storage layout depends on: transactions sharing a client connection produce one
+// connection record, and a second connection produces another.
+func TestRecordStoresOneConnectionPerClientConnection(t *testing.T) {
+	req, err := capture.Read(strings.NewReader("GET / HTTP/1.1\r\nHost: example.com\r\n\r\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec := &stubRecorder{}
+	s := New(Config{ID: "s1"}, nil, rec)
+
+	tx := func(conn int64) proxy.Transaction {
+		return proxy.Transaction{
+			Conn:     proxy.Conn{ID: conn, ClientHello: []byte{0x16}},
+			Request:  req,
+			Response: capture.Response{Status: 200},
+		}
+	}
+	s.record(tx(1))
+	s.record(tx(1))
+	s.record(tx(2))
+
+	if rec.connections != 2 {
+		t.Errorf("connection records = %d, want 2 (one per client connection)", rec.connections)
+	}
+	if len(rec.entries) != 3 {
+		t.Fatalf("entries = %d, want 3", len(rec.entries))
+	}
+	if rec.entries[0] != rec.entries[1] {
+		t.Errorf("entries on one connection referenced %d and %d", rec.entries[0], rec.entries[1])
+	}
+	if rec.entries[2] == rec.entries[0] {
+		t.Errorf("a second client connection reused connection %d", rec.entries[2])
+	}
+}
+
+// stubRecorder counts connection records and remembers which connection each
+// entry was attributed to.
+type stubRecorder struct {
+	connections int
+	entries     []int64
+}
+
+func (r *stubRecorder) CreateConnection(_ context.Context, _ string, _ model.Connection) (int64, error) {
+	r.connections++
+	return int64(r.connections), nil
+}
+
+func (r *stubRecorder) CreateEntry(_ context.Context, _ string, connection int64, _ model.Entry) (int64, error) {
+	r.entries = append(r.entries, connection)
+	return int64(len(r.entries)), nil
 }

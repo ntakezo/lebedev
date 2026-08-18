@@ -5,11 +5,10 @@
 
 Lebedev is a lightweight man-in-the-middle proxy that **never re-originates
 traffic with a proxy fingerprint**. Origin requests go out over an fhttp
-tls-client wearing a real browser's TLS ClientHello and HTTP/2 traits — by
-default the stock latest-Chrome profile (`Chrome_150_PSK`), or, with
-`--fingerprint mirror`, the intercepted client's own reconstructed fingerprint —
-while every request and response is recorded as structured, faithful data for
-inspection.
+tls-client wearing the stock latest-Chrome profile (`Chrome_150_PSK`), while
+every request and response is recorded as structured, faithful data for
+inspection — including the TLS ClientHello and HTTP/2 traits of the client that
+was intercepted.
 
 It is built for debugging and analyzing HTTPS traffic where a generic proxy would
 be detected or would alter the very behavior you are trying to observe.
@@ -17,17 +16,15 @@ be detected or would alter the very behavior you are trying to observe.
 ## Features
 
 - **Browser-fingerprinted upstream** — sends origin traffic with tls-client's
-  stock latest-Chrome profile, or mirrors the intercepted client's own JA3/JA4
-  ClientHello and HTTP/2 SETTINGS, priorities, flow control, and header ordering.
-- **HTTP/3 upgrade** — when an origin advertises HTTP/3 via `Alt-Svc`, the mirror
-  upgrades that origin from h2 to h3 for subsequent requests, exactly as a real
-  browser does, with a synthesized QUIC/h3 fingerprint matched to the client's
-  browser family and a graceful h2 fallback when QUIC is blocked.
-- **Faithful capture** — preserves header order, header casing, pseudo-header
-  order, and body bytes across HTTP/1.1 and HTTP/2.
-- **SQL-backed store** — transactions are recorded into SQL (SQLite or
-  PostgreSQL) and queried on demand. The store round-trips every observation
-  verbatim — header and cookie order, whitespace, URLs, form fields, and bodies.
+  stock latest-Chrome profile, so the origin sees a real browser's ClientHello
+  and HTTP/2 SETTINGS rather than a proxy's.
+- **Faithful capture** — preserves header order, header casing, and body bytes
+  across HTTP/1.1 and HTTP/2, and records the intercepted client's own JA3/JA4
+  ClientHello and h2 fingerprint per connection.
+- **SQLite-backed store** — the HAR 1.3 model laid out for SQLite behind a small
+  repository. It round-trips every observation verbatim — header and cookie
+  order, whitespace, URLs, form fields, and bodies — and stores one row per TLS
+  connection instead of repeating a fingerprint on every entry.
 - **Interactive REPL** — a single prompt to start captures and CRUD stored
   sessions. Built for a developer at the keyboard and for an LLM driving it
   through an MCP server.
@@ -43,11 +40,11 @@ be detected or would alter the very behavior you are trying to observe.
 
 ```
                           Lebedev
-  ┌────────┐   CONNECT   ┌──────────────────────────┐   mirrored    ┌────────┐
+  ┌────────┐   CONNECT   ┌──────────────────────────┐  stock Chrome ┌────────┐
   │ client │────────────▶│  terminate TLS w/ leaf    │  ClientHello  │ origin │
   │ (proxy │   HTTPS      │  peek + fingerprint hello │──────────────▶│ server │
   │  set)  │◀────────────│  capture request faithfully│◀──────────────│        │
-  └────────┘   response   │  replay upstream as client │   response    └────────┘
+  └────────┘   response   │  forward as latest Chrome  │   response    └────────┘
                           └──────────────────────────┘
                                       │
                                       ▼
@@ -60,8 +57,7 @@ be detected or would alter the very behavior you are trying to observe.
    signed by the local root CA.
 3. It parses the request without canonicalizing order, casing, or body.
 4. It forwards the request to the origin through an upstream client whose TLS and
-   HTTP/2 fingerprint is the stock latest-Chrome profile, or the captured
-   client's own under `--fingerprint mirror`.
+   HTTP/2 fingerprint is the stock latest-Chrome profile.
 5. The origin's response is returned to the client, and the full transaction is
    recorded as a HAR entry — queryable and exportable on demand.
 
@@ -84,11 +80,11 @@ go build -o lebedev ./cmd/lebedev
 ## Quick start
 
 Running `lebedev` opens an interactive REPL. Startup ensures the root CA exists
-and opens the durable store (`~/.lebedev/store.db` by default).
+and opens the durable store (`~/.lebedev/lebedev.db` by default).
 
 ```sh
 lebedev
-lebedev: durable store sqlite:~/.lebedev/store.db (CA: ~/.lebedev/ca.crt)
+lebedev: durable store ~/.lebedev/lebedev.db (CA: ~/.lebedev/ca.crt)
 lebedev: type 'help' for commands
 lebedev>
 ```
@@ -144,7 +140,7 @@ HAR file). Re-running `save` overwrites the stored copy, so it snapshots the
 growing session without duplicating entries.
 
 ```
-run [id] [--addr :8080] [--upstream-proxy URL] [--fingerprint chrome|mirror]
+run [id] [--addr :8080] [--upstream-proxy URL]
                        start a capture; entries stay in memory only
 save                   write the live session to the durable store
 stop <id>              stop the capture (its session stays queryable)
@@ -160,11 +156,8 @@ browser [url]          launch a fresh Chrome through the active capture
 help | quit
 ```
 
-`run` takes an optional session id (default `default`), the listen address, an
-optional per-session outbound proxy, and the upstream fingerprint. `--fingerprint
-chrome` (the default) sends origin requests with tls-client's stock latest-Chrome
-profile — Chrome 150 with real PSK resumption — while `--fingerprint mirror`
-replays the captured client's own ClientHello and h2 traits.
+`run` takes an optional session id (default `default`), the listen address, and
+an optional per-session outbound proxy.
 
 `stop <id>` pauses the capture named by
 id, leaving its in-memory session queryable; `resume <id>` re-serves it on the
@@ -177,7 +170,7 @@ durable store otherwise.
 
 | Flag        | Default                   | Description                                            |
 | ----------- | ------------------------- | ------------------------------------------------------ |
-| `--db`      | `sqlite:~/.lebedev/store.db` | Durable store DSN: `sqlite:PATH` or `postgres://…`. |
+| `--db`      | `~/.lebedev/lebedev.db`   | Path to the durable SQLite store.                      |
 | `--ca-cert` | `~/.lebedev/ca.crt`       | Path to the root CA certificate.                       |
 | `--ca-key`  | `~/.lebedev/ca.key`       | Path to the root CA private key.                       |
 
@@ -186,13 +179,22 @@ can mint a trusted certificate for any host.
 
 ## Storage and HAR format
 
-Transactions are recorded into a SQL store — SQLite by default (`~/.lebedev/store.db`),
-or PostgreSQL via `--db postgres://…`. A capture's live session is held in an
-in-memory SQLite database and reaches the durable store when you `save` it (or
-export it to HAR and import it back). The relational schema is queryable directly, and the store round-trips
-every observation verbatim; any transformation an observation needs to fit HAR
-(deriving a status text, base64-encoding a binary body) is done before the store
-sees it, so the SQL layer never alters the bytes it is handed.
+Transactions are recorded into SQLite (`~/.lebedev/lebedev.db` by default). A
+capture's live session is held in an in-memory database and reaches the durable
+store when you `save` it (or export it to HAR and import it back). The schema is
+queryable directly, and the store round-trips every observation verbatim; any
+transformation an observation needs to fit HAR (deriving a status text,
+base64-encoding a binary body) is done before the store sees it, so the SQL layer
+never alters the bytes it is handed.
+
+The layout follows the wire rather than the document. A HAR file repeats a
+connection's fingerprint on every entry; here one TLS connection is a row that
+its entries reference, and each entry's `_lebedev` field is rebuilt from it on
+read — same bytes out, stored once. Ordered lists (headers, cookies, query and
+post parameters) are child rows carrying their position, so order, casing, and
+repeated names survive instead of collapsing into a map. Tables are `STRICT`, so
+SQLite rejects a mistyped value rather than coercing it, and ownership runs
+through `ON DELETE CASCADE`.
 
 Import and export use [HAR 1.3](http://www.softwareishard.com/blog/har-12-spec/),
 the standard HTTP Archive format most browser devtools and proxies understand.
@@ -254,53 +256,34 @@ round trip byte-for-byte.
 }
 ```
 
-An upstream HTTP/3 upgrade shows up as `response.httpVersion` of `HTTP/3.0` and a
-matching `_lebedev.upstreamProto`; for h2/h1 the field is omitted.
-
 ## Fidelity and detection surface
 
-By default Lebedev sends origin traffic with the stock latest-Chrome profile
+Lebedev sends origin traffic with the stock latest-Chrome profile
 (`Chrome_150_PSK`), which supplies the ClientHello, h2 SETTINGS, and
-pseudo-header order; the captured request's headers, header order, and body are
-still reproduced verbatim. `--fingerprint mirror` swaps that profile for the
-captured client's own fingerprint, which is what the rest of this section
-describes.
+pseudo-header order. The captured request's headers, header order, casing, and
+body are reproduced verbatim on top of it:
 
-In mirror mode Lebedev reproduces the captured client toward the origin at
-several layers:
-
-- **TLS ClientHello (JA3/JA4):** cipher suites, extensions, curves, and ALPN are
-  reconstructed from the raw ClientHello.
-- **TLS session resumption:** enabled for TLS 1.3 clients, so reconnects to an
-  origin resume like a real revisiting browser instead of always full-handshaking.
-- **HTTP/2:** SETTINGS (order and values), the initial connection flow-control
-  window, PRIORITY frames, and pseudo-header/header order are mirrored. Streams
-  are forwarded concurrently, so the origin sees the client's real multiplexing
-  rather than a serialized one-request-at-a-time rewrite.
-- **HTTP/3:** origins are contacted over h2 first; once an origin's `Alt-Svc`
-  advertises `h3`, later requests to it race h3 (QUIC) against h2 and prefer
-  whichever connects first — the same in-band discovery a browser performs.
-  Because a proxied client reaches Lebedev over a TCP `CONNECT` tunnel, no real
-  QUIC ClientHello is captured, so the upstream h3 fingerprint (QUIC transport
-  parameters, h3 SETTINGS, pseudo-header order) is synthesized from the client's
-  inferred browser family (Chrome/Chromium or Firefox) rather than mirrored bit
-  for bit. The upstream protocol actually used is recorded per transaction.
-- **HTTP/1.1:** header order and casing are preserved, including Host and
-  Content-Length at their captured positions, plus chunked request framing.
+- **TLS ClientHello (JA3/JA4):** cipher suites, extensions, curves, and ALPN come
+  from the Chrome profile, including real PSK resumption, so reconnects to an
+  origin resume the way a revisiting browser's do.
+- **HTTP/1.1 and HTTP/2:** header order and casing are preserved, including Host
+  and Content-Length at their captured positions, plus chunked request framing.
 - **Bodies:** request and response bodies are forwarded as sent — no injected
   `Accept-Encoding` and no transparent decompression.
 
-Residual limitations a userspace mirror cannot remove:
+Limitations to be aware of:
 
+- **The client's own fingerprint is recorded, not replayed.** The intercepted
+  ClientHello and h2 traits are captured and stored per connection, but origin
+  traffic goes out as stock Chrome. A client that is not Chrome will present a
+  Chrome fingerprint upstream.
 - **TCP/IP stack and source IP:** the origin sees the proxy host's kernel TCP
   fingerprint (window size, options, TTL) and its IP, not the client's. Route
-  egress through an environment matching the mirrored client (`--upstream-proxy`)
-  to align this layer.
-- **HTTP/2 flow-control cadence:** initial windows are mirrored, but the timing
-  and size of subsequent WINDOW_UPDATE frames during large transfers are the
-  upstream transport's, not the captured client's.
+  egress through a matching environment (`--upstream-proxy`) to align this layer.
+- **No HTTP/3:** origins are contacted over h2/h1 only; QUIC is left to the
+  upstream rewrite.
 - **Connection coalescing:** a browser may coalesce multiple hostnames onto one
-  h2 connection; the mirror opens one upstream connection per origin authority.
+  h2 connection; the upstream client opens one connection per origin authority.
 - **Chunked request bodies** are re-chunked: the Transfer-Encoding framing is
   preserved, but the exact chunk boundaries are not.
 
@@ -319,10 +302,18 @@ The codebase is organized under `internal/`:
 | `ca`       | Root CA and per-host leaf certificate minting.                       |
 | `proxy`    | MITM core: `CONNECT`, TLS termination, and upstream dispatch.        |
 | `capture`  | Faithful HTTP/1.1 and HTTP/2 request parsing and fingerprinting.     |
-| `upstream` | Fingerprint-mirroring client that replays requests to the origin.    |
-| `session`  | Turns each transaction into a HAR entry and hands it to a recorder.  |
-| `store`    | SQL-backed persistence (SQLite/PostgreSQL) with HAR 1.3 import/export and querying. |
+| `upstream` | Stock latest-Chrome client that forwards requests to the origin.      |
+| `session`  | Turns each connection and transaction into records for a recorder.   |
 | `repl`     | Interactive control surface: captures, saving to the store, and session CRUD. |
+
+Three packages are public, for consumers that want the model or the store
+without importing anything internal:
+
+| Package             | Responsibility                                                   |
+| ------------------- | ---------------------------------------------------------------- |
+| `har`               | The strict HAR 1.3 object model.                                 |
+| `model`             | lebedev's extension of it: the capture fingerprint and store identity. |
+| `repository`        | The persistence contract, implemented over SQLite in `repository/sqlite`. |
 
 ## Security and legal
 

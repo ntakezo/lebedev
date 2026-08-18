@@ -9,8 +9,6 @@ import (
 	"time"
 
 	http "github.com/bogdanfinn/fhttp"
-	bh2 "github.com/bogdanfinn/fhttp/http2"
-	utls "github.com/bogdanfinn/utls"
 	xh2 "golang.org/x/net/http2"
 	"golang.org/x/net/http2/hpack"
 
@@ -29,7 +27,7 @@ func TestBuildRequestH1WireFraming(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	hr, err := Mirror{usedH2: false}.buildRequest(req)
+	hr, err := Client{usedH2: false}.buildRequest(req)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -71,7 +69,7 @@ func TestBuildRequestH1PreservesFramingHeaderOrder(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	hr, err := Mirror{usedH2: false}.buildRequest(req)
+	hr, err := Client{usedH2: false}.buildRequest(req)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -115,7 +113,7 @@ func TestBuildRequestH1PreservesChunkedFraming(t *testing.T) {
 		t.Fatal("capture should mark the request chunked")
 	}
 
-	hr, err := Mirror{usedH2: false}.buildRequest(req)
+	hr, err := Client{usedH2: false}.buildRequest(req)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -146,7 +144,7 @@ func TestBuildRequestContentLengthByProtocol(t *testing.T) {
 		{Name: "content-length", Value: "3"},
 	}, []byte("abc"))
 
-	hr2, err := Mirror{usedH2: true}.buildRequest(req)
+	hr2, err := Client{usedH2: true}.buildRequest(req)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -157,7 +155,7 @@ func TestBuildRequestContentLengthByProtocol(t *testing.T) {
 		t.Error("h2: content-length should appear in the header order")
 	}
 
-	hr1, err := Mirror{usedH2: false}.buildRequest(req)
+	hr1, err := Client{usedH2: false}.buildRequest(req)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -222,205 +220,27 @@ func captureH2Request(t *testing.T, fields []hpack.HeaderField, body []byte) cap
 // obtain a genuine fingerprint, then asserts buildProfile reproduces every
 // mirrored trait and derives a usable ClientHello spec from raw ClientHello
 // bytes.
-func TestBuildProfileMirrorsFingerprint(t *testing.T) {
-	fp := captureFingerprint(t)
-
-	profile, err := buildProfile(chromeHelloRecord(t), fp)
-	if err != nil {
-		t.Fatalf("buildProfile: %v", err)
-	}
-
-	settings := profile.GetSettings()
-	if settings[bh2.SettingHeaderTableSize] != 65536 ||
-		settings[bh2.SettingInitialWindowSize] != 6291456 ||
-		settings[bh2.SettingMaxHeaderListSize] != 262144 {
-		t.Errorf("settings = %+v", settings)
-	}
-	wantOrder := []bh2.SettingID{
-		bh2.SettingHeaderTableSize,
-		bh2.SettingInitialWindowSize,
-		bh2.SettingMaxHeaderListSize,
-	}
-	if got := profile.GetSettingsOrder(); !equalSettingIDs(got, wantOrder) {
-		t.Errorf("settingsOrder = %v, want %v", got, wantOrder)
-	}
-	if profile.GetConnectionFlow() != 15663105 {
-		t.Errorf("connectionFlow = %d", profile.GetConnectionFlow())
-	}
-	if ps := profile.GetPriorities(); len(ps) != 1 || ps[0].PriorityParam.Weight != 255 {
-		t.Errorf("priorities = %+v", ps)
-	}
-	wantPseudo := []string{":method", ":authority", ":scheme", ":path"}
-	if got := profile.GetPseudoHeaderOrder(); !equalStrings(got, wantPseudo) {
-		t.Errorf("pseudoOrder = %v, want %v", got, wantPseudo)
-	}
-
-	spec, err := profile.GetClientHelloSpec()
-	if err != nil {
-		t.Fatalf("GetClientHelloSpec: %v", err)
-	}
-	if len(spec.CipherSuites) == 0 || len(spec.Extensions) == 0 {
-		t.Errorf("spec looks empty: %d suites, %d extensions", len(spec.CipherSuites), len(spec.Extensions))
-	}
-}
-
-// TestNeedsResumptionPSK checks the gate that decides whether a PSK extension
-// must be added to enable upstream session resumption.
-func TestNeedsResumptionPSK(t *testing.T) {
-	firstVisit := &utls.ClientHelloSpec{Extensions: []utls.TLSExtension{
-		&utls.SNIExtension{},
-		&utls.PSKKeyExchangeModesExtension{Modes: []uint8{utls.PskModeDHE}},
-	}}
-	if !needsResumptionPSK(firstVisit) {
-		t.Error("TLS 1.3 hello with psk_key_exchange_modes and no PSK: want add")
-	}
-
-	resuming := &utls.ClientHelloSpec{Extensions: []utls.TLSExtension{
-		&utls.PSKKeyExchangeModesExtension{Modes: []uint8{utls.PskModeDHE}},
-		&utls.UtlsPreSharedKeyExtension{},
-	}}
-	if needsResumptionPSK(resuming) {
-		t.Error("hello already carrying a PSK extension: want no add")
-	}
-
-	tls12 := &utls.ClientHelloSpec{Extensions: []utls.TLSExtension{&utls.SNIExtension{}}}
-	if needsResumptionPSK(tls12) {
-		t.Error("no psk_key_exchange_modes: want no add")
-	}
-}
-
-// TestBuildProfileEnablesResumption asserts that a first-visit TLS 1.3 hello ends
-// up with a cache-managed UtlsPreSharedKeyExtension as its final extension, which
-// is what makes tls-client enable its session-resumption cache upstream.
-func TestBuildProfileEnablesResumption(t *testing.T) {
-	profile, err := buildProfile(chromeHelloRecord(t), captureFingerprint(t))
-	if err != nil {
-		t.Fatalf("buildProfile: %v", err)
-	}
-	spec, err := profile.GetClientHelloSpec()
-	if err != nil {
-		t.Fatalf("GetClientHelloSpec: %v", err)
-	}
-	if len(spec.Extensions) == 0 {
-		t.Fatal("spec has no extensions")
-	}
-	last := spec.Extensions[len(spec.Extensions)-1]
-	if _, ok := last.(*utls.UtlsPreSharedKeyExtension); !ok {
-		t.Errorf("last extension = %T, want *utls.UtlsPreSharedKeyExtension", last)
-	}
-}
-
-// captureFingerprint runs capture.ServeHTTP2 against a synthetic h2 client and
-// returns the fingerprint it observed.
-func captureFingerprint(t *testing.T) capture.HTTP2Fingerprint {
-	t.Helper()
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer ln.Close()
-
-	got := make(chan capture.HTTP2Fingerprint, 1)
-	go func() {
-		conn, err := ln.Accept()
+func TestNewStockChromeBuildsClient(t *testing.T) {
+	for _, h2 := range []bool{true, false} {
+		c, err := NewStockChrome(h2, "")
 		if err != nil {
-			return
+			t.Fatal(err)
 		}
-		defer conn.Close()
-		capture.ServeHTTP2(conn, func(_ capture.Request, fp capture.HTTP2Fingerprint) (capture.Response, error) {
-			got <- fp
-			return capture.Response{Status: 200, Body: []byte("ok")}, nil
-		})
-	}()
-
-	cc, err := net.Dial("tcp", ln.Addr().String())
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer cc.Close()
-	cc.SetDeadline(time.Now().Add(5 * time.Second))
-	cc.Write([]byte("PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"))
-
-	cf := xh2.NewFramer(cc, cc)
-	cf.WriteSettings(
-		xh2.Setting{ID: xh2.SettingHeaderTableSize, Val: 65536},
-		xh2.Setting{ID: xh2.SettingInitialWindowSize, Val: 6291456},
-		xh2.Setting{ID: xh2.SettingMaxHeaderListSize, Val: 262144},
-	)
-	cf.WriteWindowUpdate(0, 15663105)
-	cf.WritePriority(1, xh2.PriorityParam{StreamDep: 0, Weight: 255})
-
-	var hb bytes.Buffer
-	he := hpack.NewEncoder(&hb)
-	for _, f := range []hpack.HeaderField{
-		{Name: ":method", Value: "GET"},
-		{Name: ":authority", Value: "example.com"},
-		{Name: ":scheme", Value: "https"},
-		{Name: ":path", Value: "/"},
-		{Name: "user-agent", Value: "Mozilla/5.0"},
-	} {
-		he.WriteField(f)
-	}
-	cf.WriteHeaders(xh2.HeadersFrameParam{StreamID: 1, BlockFragment: hb.Bytes(), EndStream: true, EndHeaders: true})
-
-	select {
-	case fp := <-got:
-		return fp
-	case <-time.After(5 * time.Second):
-		t.Fatal("capture never produced a fingerprint")
-		return capture.HTTP2Fingerprint{}
-	}
-}
-
-// chromeHelloRecord builds a full ClientHello TLS record (record header +
-// handshake) for a Chrome fingerprint, as FingerprintClientHello expects.
-func chromeHelloRecord(t *testing.T) []byte {
-	t.Helper()
-	c1, c2 := net.Pipe()
-	defer c1.Close()
-	defer c2.Close()
-
-	uc := utls.UClient(c1, &utls.Config{ServerName: "example.com"}, utls.HelloChrome_120, false, false, true)
-	if err := uc.BuildHandshakeState(); err != nil {
-		t.Fatal(err)
-	}
-	hello := uc.HandshakeState.Hello.Raw
-
-	rec := make([]byte, 5+len(hello))
-	rec[0] = 0x16 // handshake record
-	rec[1] = 0x03
-	rec[2] = 0x01
-	rec[3] = byte(len(hello) >> 8)
-	rec[4] = byte(len(hello))
-	copy(rec[5:], hello)
-	return rec
-}
-
-func equalSettingIDs(a, b []bh2.SettingID) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for i := range a {
-		if a[i] != b[i] {
-			return false
+		if c.http == nil {
+			t.Fatalf("h2=%v: no client built", h2)
+		}
+		if c.usedH2 != h2 {
+			t.Errorf("h2=%v: usedH2 = %v, want %v", h2, c.usedH2, h2)
 		}
 	}
-	return true
+	if got := stockChromeProfile.GetClientHelloStr(); got != "Chrome-150_PSK" {
+		t.Errorf("stock profile = %q, want the latest Chrome PSK profile", got)
+	}
 }
 
-func equalStrings(a, b []string) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for i := range a {
-		if a[i] != b[i] {
-			return false
-		}
-	}
-	return true
-}
-
-func TestStockChromeUsesProfilePseudoOrder(t *testing.T) {
+// The stock profile carries its own pseudo-header order, so a captured one is
+// never replayed over it.
+func TestBuildRequestLeavesPseudoOrderToProfile(t *testing.T) {
 	req := captureH2Request(t, []hpack.HeaderField{
 		{Name: ":method", Value: "GET"},
 		{Name: ":authority", Value: "example.com"},
@@ -429,44 +249,14 @@ func TestStockChromeUsesProfilePseudoOrder(t *testing.T) {
 		{Name: "user-agent", Value: "UA"},
 	}, nil)
 
-	stock, err := Mirror{usedH2: true, stock: true}.buildRequest(req)
+	hr, err := Client{usedH2: true}.buildRequest(req)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if po, ok := stock.Header[http.PHeaderOrderKey]; ok {
-		t.Errorf("stock profile should supply its own pseudo order, got %v", po)
+	if po, ok := hr.Header[http.PHeaderOrderKey]; ok {
+		t.Errorf("pseudo order should come from the profile, got %v", po)
 	}
-	// The captured header order still drives the ordinary headers.
-	if !slices.Contains(stock.Header[http.HeaderOrderKey], "user-agent") {
+	if !slices.Contains(hr.Header[http.HeaderOrderKey], "user-agent") {
 		t.Error("captured header order should still be reproduced")
-	}
-
-	mirrored, err := Mirror{usedH2: true}.buildRequest(req)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, ok := mirrored.Header[http.PHeaderOrderKey]; !ok {
-		t.Error("mirror mode should reproduce the captured pseudo order")
-	}
-}
-
-func TestNewStockChromeBuildsStockClient(t *testing.T) {
-	for _, h2 := range []bool{true, false} {
-		m, err := NewStockChrome(h2, "")
-		if err != nil {
-			t.Fatal(err)
-		}
-		if !m.stock {
-			t.Errorf("h2=%v: mirror should be marked stock", h2)
-		}
-		if m.usedH2 != h2 {
-			t.Errorf("h2=%v: usedH2 = %v, want %v", h2, m.usedH2, h2)
-		}
-		if (m.up != nil) != h2 {
-			t.Errorf("h2=%v: h3 upgrade state presence = %v, want %v", h2, m.up != nil, h2)
-		}
-	}
-	if got := stockChromeProfile.GetClientHelloStr(); got != "Chrome-150_PSK" {
-		t.Errorf("stock profile = %q, want the latest Chrome PSK profile", got)
 	}
 }

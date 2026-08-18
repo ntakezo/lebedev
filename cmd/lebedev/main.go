@@ -12,13 +12,15 @@ import (
 
 	"github.com/ntakezo/lebedev/internal/ca"
 	"github.com/ntakezo/lebedev/internal/repl"
-	"github.com/ntakezo/lebedev/internal/store"
+	"github.com/ntakezo/lebedev/repository/sqlite"
 )
 
 func main() {
 	fs := flag.NewFlagSet("lebedev", flag.ExitOnError)
 	dir := defaultDir()
-	db := fs.String("db", "sqlite:"+filepath.Join(dir, "store.db"), "durable store DSN: sqlite:PATH or postgres://…")
+	// A new filename rather than the old store.db: the schema is a rewrite with no
+	// migration from the previous layout, so an existing store is left alone.
+	db := fs.String("db", filepath.Join(dir, "lebedev.db"), "path to the durable SQLite store")
 	certPath := fs.String("ca-cert", filepath.Join(dir, "ca.crt"), "path to the CA certificate")
 	keyPath := fs.String("ca-key", filepath.Join(dir, "ca.key"), "path to the CA private key")
 	fs.Parse(os.Args[1:])
@@ -27,16 +29,16 @@ func main() {
 	if err != nil {
 		fatal("ca: %v", err)
 	}
-	st, err := store.Open(*db)
+	repo, err := sqlite.Open(*db)
 	if err != nil {
 		fatal("store: %v", err)
 	}
-	defer st.Close()
+	defer repo.Close()
 
 	fmt.Fprintf(os.Stderr, "lebedev: durable store %s (CA: %s)\n", *db, *certPath)
 	fmt.Fprintln(os.Stderr, "lebedev: type 'help' for commands")
 
-	if err := repl.New(st, authority, *certPath, os.Stdout).Run(os.Stdin); err != nil {
+	if err := repl.New(repo, authority, *certPath, os.Stdout).Run(os.Stdin); err != nil {
 		fatal("repl: %v", err)
 	}
 }

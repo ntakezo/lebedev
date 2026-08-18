@@ -22,21 +22,39 @@ const harTime = "2006-01-02T15:04:05.000Z07:00"
 // entryFromTransaction builds a HAR entry from one captured transaction, stamped
 // at now. This is where the faithful observation is translated into HAR's model:
 // bodies that are not valid UTF-8 are carried base64-encoded (the store never
-// touches the bytes), header and cookie order is preserved, and the TLS/HTTP2
-// fingerprint rides along in the custom _lebedev field.
-func entryFromTransaction(id string, tx proxy.Transaction, now time.Time) model.Entry {
+// touches the bytes) and header and cookie order is preserved. The TLS and HTTP/2
+// fingerprint is not part of the entry — it belongs to the connection the entry
+// was captured over (see connectionFromTransaction) and is rebuilt into the
+// _lebedev field on read.
+func entryFromTransaction(tx proxy.Transaction, now time.Time) model.Entry {
 	req := tx.Request
 	resp := tx.Response
 
-	e := model.Entry{
+	return model.Entry{
 		StartedDateTime: now.UTC().Format(harTime),
 		Request:         requestEntry(req),
 		Response:        responseEntry(req, resp),
 		Cache:           har.Cache{},
 		Timings:         har.Timings{Send: 0, Wait: 0, Receive: 0},
-		Lebedev:         lebedevMeta(id, req, resp, tx),
 	}
-	return e
+}
+
+// connectionFromTransaction builds the connection record for the client
+// connection a transaction was observed on: the raw ClientHello, the HTTP/2
+// traits negotiated over it, and the protocol actually spoken upstream when it
+// differed from the client's.
+func connectionFromTransaction(id string, tx proxy.Transaction) model.Connection {
+	c := model.Connection{Session: id}
+	if len(tx.Conn.ClientHello) > 0 {
+		c.ClientHelloHex = hex.EncodeToString(tx.Conn.ClientHello)
+	}
+	if tx.Response.Proto != "" && tx.Response.Proto != tx.Request.Proto() {
+		c.UpstreamProto = tx.Response.Proto
+	}
+	if tx.Request.Proto() == "HTTP/2.0" {
+		c.HTTP2 = http2Fingerprint(tx.Conn.H2)
+	}
+	return c
 }
 
 func requestEntry(req capture.Request) har.Request {
@@ -90,22 +108,6 @@ func responseProto(req capture.Request, resp capture.Response) string {
 		return resp.Proto
 	}
 	return req.Proto()
-}
-
-func lebedevMeta(id string, req capture.Request, resp capture.Response, tx proxy.Transaction) *model.Lebedev {
-	lb := &model.Lebedev{Session: id}
-	if len(tx.ClientHello) > 0 {
-		lb.ClientHelloHex = hex.EncodeToString(tx.ClientHello)
-	}
-	// Surface the upstream protocol only when it diverged from the client's — i.e.
-	// the mirror upgraded the origin to HTTP/3.
-	if resp.Proto != "" && resp.Proto != req.Proto() {
-		lb.UpstreamProto = resp.Proto
-	}
-	if req.Proto() == "HTTP/2.0" {
-		lb.HTTP2 = http2Fingerprint(tx.H2)
-	}
-	return lb
 }
 
 func http2Fingerprint(fp capture.HTTP2Fingerprint) *model.HTTP2 {

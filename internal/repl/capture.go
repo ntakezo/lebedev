@@ -7,23 +7,23 @@ import (
 	"net"
 	"sync"
 
+	"github.com/ntakezo/lebedev/har"
 	"github.com/ntakezo/lebedev/internal/ca"
-	"github.com/ntakezo/lebedev/internal/proxy"
 	"github.com/ntakezo/lebedev/internal/session"
-	"github.com/ntakezo/lebedev/internal/store"
 	"github.com/ntakezo/lebedev/model"
+	"github.com/ntakezo/lebedev/repository"
+	"github.com/ntakezo/lebedev/repository/sqlite"
 )
 
-// capture is one proxy run. Its entries accumulate in an in-memory store and are
-// discarded when the capture is closed; use save or export to keep anything worth
-// keeping. A stopped capture can be resumed: it retains the CA authority, upstream
-// proxy, and bound address needed to re-serve the same in-memory session.
+// capture is one proxy run. Its entries accumulate in an in-memory repository and
+// are discarded when the capture is closed; use save or export to keep anything
+// worth keeping. A stopped capture can be resumed: it retains the CA authority,
+// upstream proxy, and bound address needed to re-serve the same in-memory session.
 type capture struct {
 	id            string
-	mem           *store.Store
+	mem           *sqlite.Repository
 	authority     *ca.Authority
 	upstreamProxy string
-	fingerprint   proxy.Fingerprint
 
 	mu       sync.Mutex
 	bindAddr string // concrete bound address, reused when resuming
@@ -32,12 +32,19 @@ type capture struct {
 	running  bool
 }
 
-// startCapture opens an in-memory store for the session and begins serving the
-// MITM proxy on addr with the given upstream fingerprint. Entries live only in
-// memory for the life of the capture.
-func startCapture(id, addr, upstreamProxy string, fingerprint proxy.Fingerprint, authority *ca.Authority) (*capture, error) {
-	mem, err := store.Open("")
+// startCapture opens an in-memory repository for the session and begins serving
+// the MITM proxy on addr. Entries live only in memory for the life of the capture.
+func startCapture(id, addr, upstreamProxy string, authority *ca.Authority) (*capture, error) {
+	mem, err := sqlite.Open("")
 	if err != nil {
+		return nil, err
+	}
+	_, err = mem.CreateSession(context.Background(), repository.Session{
+		Name: id,
+		Log:  model.Log{Version: "1.3", Creator: har.Creator{Name: "lebedev", Version: "1.3"}},
+	})
+	if err != nil {
+		mem.Close()
 		return nil, err
 	}
 	c := &capture{
@@ -45,7 +52,6 @@ func startCapture(id, addr, upstreamProxy string, fingerprint proxy.Fingerprint,
 		mem:           mem,
 		authority:     authority,
 		upstreamProxy: upstreamProxy,
-		fingerprint:   fingerprint,
 		bindAddr:      addr,
 	}
 	if err := c.serve(); err != nil {
@@ -67,7 +73,7 @@ func (c *capture) serve() error {
 	c.ln = ln
 	c.serveErr = make(chan error, 1)
 	c.running = true
-	sess := session.New(session.Config{ID: c.id, OutboundProxy: c.upstreamProxy, Fingerprint: c.fingerprint}, c.authority, c)
+	sess := session.New(session.Config{ID: c.id, OutboundProxy: c.upstreamProxy}, c.authority, c.mem)
 	go func() { c.serveErr <- sess.Serve(ln) }()
 	return nil
 }
@@ -83,17 +89,16 @@ func (c *capture) resume() error {
 	return c.serve()
 }
 
-// Insert records an entry into the in-memory store.
-func (c *capture) Insert(ctx context.Context, sessionID string, e model.Entry, at int64) (int64, error) {
-	return c.mem.Insert(ctx, sessionID, e, at)
-}
-
 // addr returns the address the proxy is listening on.
 func (c *capture) addr() string { return c.ln.Addr().String() }
 
 // count returns how many entries the live session currently holds in memory.
 func (c *capture) count(ctx context.Context) (int, error) {
-	return c.mem.Count(ctx, store.Query{Session: c.id})
+	d, err := c.mem.Session(ctx, c.id)
+	if err != nil {
+		return 0, err
+	}
+	return len(d.Entries), nil
 }
 
 // stop shuts the proxy listener down and waits for the serve loop to return. The
@@ -116,8 +121,8 @@ func (c *capture) stop() error {
 	return err
 }
 
-// close stops the proxy if needed and releases the in-memory store, discarding
-// its entries.
+// close stops the proxy if needed and releases the in-memory repository,
+// discarding its entries.
 func (c *capture) close() error {
 	if err := c.stop(); err != nil {
 		// Report the serve error but still release the store.

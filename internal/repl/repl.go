@@ -8,6 +8,7 @@ package repl
 import (
 	"bufio"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -15,18 +16,16 @@ import (
 	"runtime"
 	"strings"
 
-	"github.com/ntakezo/lebedev/har"
 	"github.com/ntakezo/lebedev/internal/browser"
 	"github.com/ntakezo/lebedev/internal/ca"
-	"github.com/ntakezo/lebedev/internal/proxy"
-	"github.com/ntakezo/lebedev/internal/store"
-	"github.com/ntakezo/lebedev/model"
+	"github.com/ntakezo/lebedev/repository"
+	"github.com/ntakezo/lebedev/repository/sqlite"
 )
 
-// REPL holds the durable store, the CA used to mint leaves, and the current
+// REPL holds the durable repository, the CA used to mint leaves, and the current
 // capture (if any). It reads commands from in and writes output to out.
 type REPL struct {
-	durable   *store.Store
+	durable   *sqlite.Repository
 	authority *ca.Authority
 	caCert    string
 	out       io.Writer
@@ -35,9 +34,9 @@ type REPL struct {
 	browserCancel []func()
 }
 
-// New builds a REPL over a durable store and CA authority. caCert is reported by
-// the cert command for trust instructions.
-func New(durable *store.Store, authority *ca.Authority, caCert string, out io.Writer) *REPL {
+// New builds a REPL over a durable repository and CA authority. caCert is
+// reported by the cert command for trust instructions.
+func New(durable *sqlite.Repository, authority *ca.Authority, caCert string, out io.Writer) *REPL {
 	return &REPL{durable: durable, authority: authority, caCert: caCert, out: out}
 }
 
@@ -106,11 +105,8 @@ func (r *REPL) dispatch(line string) (quit bool) {
 
 func (r *REPL) help() {
 	fmt.Fprint(r.out, `commands:
-  run [id] [--addr :8080] [--upstream-proxy URL] [--fingerprint chrome|mirror]
-                         start a capture; entries stay in memory only.
-                         --fingerprint chrome (default) sends origin requests
-                         with the stock latest-Chrome profile; mirror replays
-                         the captured client's own fingerprint
+  run [id] [--addr :8080] [--upstream-proxy URL]
+                         start a capture; entries stay in memory only
   save                   write the live session to the durable store
   stop <id>              stop the capture (its session stays queryable)
   resume <id>            resume a stopped capture on its address
@@ -128,7 +124,6 @@ func (r *REPL) help() {
 
 func (r *REPL) cmdRun(args []string) {
 	id, addr, upstream := "default", ":8080", ""
-	fingerprint := proxy.StockChrome
 	positional := true
 	for i := 0; i < len(args); i++ {
 		switch args[i] {
@@ -141,16 +136,6 @@ func (r *REPL) cmdRun(args []string) {
 			if i+1 < len(args) {
 				i++
 				upstream = args[i]
-			}
-		case "--fingerprint":
-			if i+1 < len(args) {
-				i++
-				fp, err := parseFingerprint(args[i])
-				if err != nil {
-					r.printf("run: %v", err)
-					return
-				}
-				fingerprint = fp
 			}
 		default:
 			if positional && !strings.HasPrefix(args[i], "--") {
@@ -169,24 +154,13 @@ func (r *REPL) cmdRun(args []string) {
 		r.current = nil
 	}
 
-	c, err := startCapture(id, addr, upstream, fingerprint, r.authority)
+	c, err := startCapture(id, addr, upstream, r.authority)
 	if err != nil {
 		r.printf("run: %v", err)
 		return
 	}
 	r.current = c
-	r.printf("capturing session %q on %s with the %s fingerprint — entries are in memory only ('save' to keep them)", id, c.addr(), fingerprint)
-}
-
-// parseFingerprint resolves the --fingerprint argument to an upstream mode.
-func parseFingerprint(name string) (proxy.Fingerprint, error) {
-	switch proxy.Fingerprint(name) {
-	case proxy.StockChrome:
-		return proxy.StockChrome, nil
-	case proxy.MirrorClient:
-		return proxy.MirrorClient, nil
-	}
-	return "", fmt.Errorf("unknown fingerprint %q — want %q or %q", name, proxy.StockChrome, proxy.MirrorClient)
+	r.printf("capturing session %q on %s — entries are in memory only ('save' to keep them)", id, c.addr())
 }
 
 // cmdSave writes the live session's in-memory entries to the durable store. It
@@ -198,30 +172,27 @@ func (r *REPL) cmdSave(ctx context.Context) {
 		return
 	}
 	id := r.current.id
-	stored, err := r.current.mem.List(ctx, store.Query{Session: id, Ascending: true})
+	n, err := r.current.count(ctx)
 	if err != nil {
 		r.printf("save: %v", err)
 		return
 	}
-	if len(stored) == 0 {
+	if n == 0 {
 		r.printf("save: session %q has no entries yet", id)
 		return
 	}
-	if err := r.durable.DeleteSession(ctx, id); err != nil {
+	// Overwrite any stored copy, so re-running save snapshots the growing session
+	// rather than duplicating it.
+	if err := r.durable.DeleteSession(ctx, id); err != nil && !errors.Is(err, repository.ErrNotFound) {
 		r.printf("save: %v", err)
 		return
 	}
-	if err := r.durable.PutLog(ctx, id, model.Log{Version: "1.3", Creator: har.Creator{Name: "lebedev", Version: "1.3"}}); err != nil {
+	copied, err := copySession(ctx, r.durable, r.current.mem, id)
+	if err != nil {
 		r.printf("save: %v", err)
 		return
 	}
-	for i, st := range stored {
-		if _, err := r.durable.Insert(ctx, id, st.Entry, int64(i)); err != nil {
-			r.printf("save: %v", err)
-			return
-		}
-	}
-	r.printf("saved session %q to the durable store (%d entries)", id, len(stored))
+	r.printf("saved session %q to the durable store (%d entries)", id, copied)
 }
 
 func (r *REPL) cmdStop(args []string) {
@@ -267,7 +238,7 @@ func (r *REPL) cmdResume(args []string) {
 }
 
 func (r *REPL) cmdSessions(ctx context.Context) {
-	infos, err := r.durable.SessionInfos(ctx)
+	infos, err := r.durable.Sessions(ctx)
 	if err != nil {
 		r.printf("sessions: %v", err)
 		return
@@ -277,7 +248,7 @@ func (r *REPL) cmdSessions(ctx context.Context) {
 		return
 	}
 	for _, si := range infos {
-		r.printf("  %-20s %d entries  [stored]", si.Session, si.Entries)
+		r.printf("  %-20s %d entries, %d connections  [stored]", si.Name, si.Entries, si.Connections)
 	}
 	if r.current != nil {
 		n, _ := r.current.count(ctx)
@@ -299,18 +270,20 @@ func (r *REPL) cmdShow(ctx context.Context, args []string) {
 	if len(args) > 1 {
 		fmt.Sscanf(args[1], "%d", &limit)
 	}
-	st := r.storeFor(id)
-	entries, err := st.List(ctx, store.Query{Session: id, Ascending: true, Limit: limit})
+	d, err := r.repoFor(id).Session(ctx, id)
 	if err != nil {
 		r.printf("show: %v", err)
 		return
 	}
-	if len(entries) == 0 {
+	if len(d.Entries) == 0 {
 		r.printf("no entries for session %q", id)
 		return
 	}
-	for i, e := range entries {
-		r.printf("  %3d  %-6s %3d  %s", i+1, e.Entry.Request.Method, e.Entry.Response.Status, e.Entry.Request.URL)
+	for i, e := range d.Entries {
+		if limit > 0 && i >= limit {
+			break
+		}
+		r.printf("  %3d  %-6s %3d  conn %-3d  %s", e.ID, e.Method, e.Status, e.Connection, e.URL)
 	}
 }
 
@@ -344,7 +317,6 @@ func (r *REPL) cmdExport(ctx context.Context, args []string) {
 		return
 	}
 	id := args[0]
-	st := r.storeFor(id)
 	var w io.Writer = r.out
 	var closer io.Closer
 	if len(args) > 1 {
@@ -355,7 +327,7 @@ func (r *REPL) cmdExport(ctx context.Context, args []string) {
 		}
 		w, closer = f, f
 	}
-	if err := st.Export(ctx, store.Query{Session: id}, w); err != nil {
+	if err := exportHAR(ctx, r.repoFor(id), id, w); err != nil {
 		r.printf("export: %v", err)
 	}
 	if closer != nil {
@@ -380,7 +352,7 @@ func (r *REPL) cmdImport(ctx context.Context, args []string) {
 		return
 	}
 	defer f.Close()
-	n, err := r.durable.Import(ctx, id, f)
+	n, err := importHAR(ctx, r.durable, id, f)
 	if err != nil {
 		r.printf("import: %v", err)
 		return
@@ -418,9 +390,9 @@ func (r *REPL) cmdBrowser(args []string) {
 	r.printf("launched Chrome at %s through %s", url, proxyURL)
 }
 
-// storeFor returns the store that holds a session: the live in-memory store when
-// the id names the active capture, otherwise the durable store.
-func (r *REPL) storeFor(id string) *store.Store {
+// repoFor returns the repository that holds a session: the live in-memory one
+// when the id names the active capture, otherwise the durable one.
+func (r *REPL) repoFor(id string) *sqlite.Repository {
 	if r.current != nil && r.current.id == id {
 		return r.current.mem
 	}
