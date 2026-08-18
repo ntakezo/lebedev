@@ -89,10 +89,41 @@ type Setting struct {
 	Value uint32 `json:"value"`
 }
 
+// Connection is one client TLS connection as observed on the wire: the raw
+// ClientHello, the HTTP/2 traits negotiated over it, and the protocol the mirror
+// actually spoke upstream. On the wire a single connection carries many
+// transactions, so it is stored once and referenced by every entry captured over
+// it; an entry's _lebedev field is rebuilt from it on read. ID and Session are
+// the store identity, zero until the connection is persisted.
+type Connection struct {
+	ID             int64
+	Session        string
+	ClientHelloHex string
+	UpstreamProto  string
+	HTTP2          *HTTP2
+}
+
+// Lebedev returns the _lebedev entry extension c contributes to every entry
+// captured over it, so a stored entry exports the same custom field it was
+// recorded with. It returns nil when the connection carries nothing to report.
+func (c Connection) Lebedev() *Lebedev {
+	if c.ClientHelloHex == "" && c.UpstreamProto == "" && c.HTTP2 == nil {
+		return nil
+	}
+	return &Lebedev{
+		Session:        c.Session,
+		ClientHelloHex: c.ClientHelloHex,
+		UpstreamProto:  c.UpstreamProto,
+		HTTP2:          c.HTTP2,
+	}
+}
+
 // Stored is one persisted entry together with the store identity that HAR itself
-// does not carry: the row id and the owning session.
+// does not carry: the row id, the owning session, and the connection the entry
+// was captured over (zero when it was recorded without one).
 type Stored struct {
-	ID      int64
-	Session string
-	Entry   Entry
+	ID         int64
+	Session    string
+	Connection int64
+	Entry      Entry
 }
