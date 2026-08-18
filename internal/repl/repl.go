@@ -1,43 +1,30 @@
-// Package repl is Lebedev's interactive control surface. A single durable store
-// (the "system state") is opened for the life of the process; from the prompt the
-// user starts capture runs and performs CRUD over stored sessions. A capture run's
-// entries live in memory and are discarded on exit; use export or import to move
-// data between a live session and the durable store.
+// Package repl is Lebedev's interactive control surface: a prompt that parses a
+// command line, calls the shared service, and formats the result for a person at
+// a keyboard. It holds no capture or storage logic of its own — everything it can
+// do, package service can do, which is what keeps it and the MCP server in step.
 package repl
 
 import (
 	"bufio"
 	"context"
-	"errors"
+	"encoding/json"
 	"fmt"
 	"io"
-	"os"
-	"path/filepath"
-	"runtime"
+	"strconv"
 	"strings"
 
-	"github.com/ntakezo/lebedev/internal/browser"
-	"github.com/ntakezo/lebedev/internal/ca"
-	"github.com/ntakezo/lebedev/repository"
-	"github.com/ntakezo/lebedev/repository/sqlite"
+	"github.com/ntakezo/lebedev/internal/service"
 )
 
-// REPL holds the durable repository, the CA used to mint leaves, and the current
-// capture (if any). It reads commands from in and writes output to out.
+// REPL reads commands from an input stream and writes results to out.
 type REPL struct {
-	durable   *sqlite.Repository
-	authority *ca.Authority
-	caCert    string
-	out       io.Writer
-
-	current       *capture
-	browserCancel []func()
+	svc *service.Service
+	out io.Writer
 }
 
-// New builds a REPL over a durable repository and CA authority. caCert is
-// reported by the cert command for trust instructions.
-func New(durable *sqlite.Repository, authority *ca.Authority, caCert string, out io.Writer) *REPL {
-	return &REPL{durable: durable, authority: authority, caCert: caCert, out: out}
+// New builds a REPL over a service.
+func New(svc *service.Service, out io.Writer) *REPL {
+	return &REPL{svc: svc, out: out}
 }
 
 // Run reads and executes commands until EOF or a quit command, then tears down
@@ -55,7 +42,7 @@ func (r *REPL) Run(in io.Reader) error {
 		}
 		r.prompt()
 	}
-	r.shutdown()
+	r.svc.Close()
 	return sc.Err()
 }
 
@@ -72,21 +59,27 @@ func (r *REPL) dispatch(line string) (quit bool) {
 	case "help", "?":
 		r.help()
 	case "run":
-		r.cmdRun(args)
+		r.cmdRun(ctx, args)
 	case "save":
 		r.cmdSave(ctx)
 	case "stop":
-		r.cmdStop(args)
+		r.cmdStop(ctx, args)
 	case "resume":
-		r.cmdResume(args)
+		r.cmdResume(ctx, args)
 	case "sessions", "ls":
 		r.cmdSessions(ctx)
 	case "show", "cat":
 		r.cmdShow(ctx, args)
+	case "entry":
+		r.cmdEntry(ctx, args)
+	case "conn":
+		r.cmdConnection(ctx, args)
 	case "rename", "mv":
 		r.cmdRename(ctx, args)
 	case "rm", "delete", "del":
 		r.cmdDelete(ctx, args)
+	case "rm-entry":
+		r.cmdDeleteEntry(ctx, args)
 	case "export":
 		r.cmdExport(ctx, args)
 	case "import":
@@ -106,157 +99,116 @@ func (r *REPL) dispatch(line string) (quit bool) {
 func (r *REPL) help() {
 	fmt.Fprint(r.out, `commands:
   run [id] [--addr :8080] [--upstream-proxy URL]
-                         start a capture; entries stay in memory only
-  save                   write the live session to the durable store
-  stop <id>              stop the capture (its session stays queryable)
-  resume <id>            resume a stopped capture on its address
-  sessions | ls          list stored sessions (and the live one, if any)
-  show <id> [limit]      list a session's entries
-  export <id> [file]     write a session as HAR 1.3 (stdout if no file)
-  import <file> [as id]  load a HAR 1.3 document into the durable store
-  rename <old> <new>     rename a stored session
-  rm <id>                delete a stored session
-  cert                   print CA trust instructions
-  browser [url]          launch a fresh Chrome through the active capture
+                            start a capture; entries stay in memory only
+  save                      write the live session to the durable store
+  stop <id>                 stop the capture (its session stays queryable)
+  resume <id>               resume a stopped capture on its address
+  sessions | ls             list stored sessions (and the live one, if any)
+  show <id> [limit]         list a session's entries
+  entry <session> <id>      print one entry as HAR JSON
+  conn <session> <id>       print one TLS connection's fingerprint
+  export <id> [file]        write a session as HAR 1.3 (stdout if no file)
+  import <file> [as id]     load a HAR 1.3 document into the durable store
+  rename <old> <new>        rename a stored session
+  rm <id>                   delete a stored session
+  rm-entry <session> <id>   delete one entry
+  cert                      print CA trust instructions
+  browser [url]             launch a fresh Chrome through the active capture
   help | quit
 `)
 }
 
-func (r *REPL) cmdRun(args []string) {
-	id, addr, upstream := "default", ":8080", ""
+func (r *REPL) cmdRun(ctx context.Context, args []string) {
+	opts := service.RunOptions{}
 	positional := true
 	for i := 0; i < len(args); i++ {
 		switch args[i] {
 		case "--addr":
 			if i+1 < len(args) {
 				i++
-				addr = args[i]
+				opts.Addr = args[i]
 			}
 		case "--upstream-proxy":
 			if i+1 < len(args) {
 				i++
-				upstream = args[i]
+				opts.OutboundProxy = args[i]
 			}
 		default:
 			if positional && !strings.HasPrefix(args[i], "--") {
-				id = args[i]
+				opts.ID = args[i]
 			}
 		}
 		positional = false
 	}
 
-	if r.current != nil && r.current.running {
-		r.printf("capture %q is already active on %s — 'stop %s' first", r.current.id, r.current.addr(), r.current.id)
-		return
-	}
-	if r.current != nil {
-		r.current.close()
-		r.current = nil
-	}
-
-	c, err := startCapture(id, addr, upstream, r.authority)
+	c, err := r.svc.StartCapture(ctx, opts)
 	if err != nil {
 		r.printf("run: %v", err)
 		return
 	}
-	r.current = c
-	r.printf("capturing session %q on %s — entries are in memory only ('save' to keep them)", id, c.addr())
+	r.printf("capturing session %q on %s — entries are in memory only ('save' to keep them)", c.ID, c.Addr)
 }
 
-// cmdSave writes the live session's in-memory entries to the durable store. It
-// overwrites any existing stored copy of the same id, so re-running it snapshots
-// the growing session without duplicating entries.
 func (r *REPL) cmdSave(ctx context.Context) {
-	if r.current == nil {
-		r.printf("no active session — 'run' one first")
-		return
-	}
-	id := r.current.id
-	n, err := r.current.count(ctx)
+	n, err := r.svc.SaveCapture(ctx)
 	if err != nil {
 		r.printf("save: %v", err)
 		return
 	}
-	if n == 0 {
-		r.printf("save: session %q has no entries yet", id)
-		return
-	}
-	// Overwrite any stored copy, so re-running save snapshots the growing session
-	// rather than duplicating it.
-	if err := r.durable.DeleteSession(ctx, id); err != nil && !errors.Is(err, repository.ErrNotFound) {
-		r.printf("save: %v", err)
-		return
-	}
-	copied, err := copySession(ctx, r.durable, r.current.mem, id)
-	if err != nil {
-		r.printf("save: %v", err)
-		return
-	}
-	r.printf("saved session %q to the durable store (%d entries)", id, copied)
+	c, _, _ := r.svc.ActiveCapture(ctx)
+	r.printf("saved session %q to the durable store (%d entries)", c.ID, n)
 }
 
-func (r *REPL) cmdStop(args []string) {
+func (r *REPL) cmdStop(ctx context.Context, args []string) {
 	if len(args) == 0 {
 		r.printf("stop: need a session id")
 		return
 	}
-	id := args[0]
-	if r.current == nil || r.current.id != id {
-		r.printf("no active capture %q", id)
-		return
-	}
-	if !r.current.running {
-		r.printf("capture %q is already stopped", id)
-		return
-	}
-	if err := r.current.stop(); err != nil {
+	c, err := r.svc.StopCapture(ctx, args[0])
+	if err != nil {
 		r.printf("stop: %v", err)
 		return
 	}
-	r.printf("stopped capture %q (still queryable; 'resume %s' to continue, 'save' to keep it)", id, id)
+	r.printf("stopped capture %q (still queryable; 'resume %s' to continue, 'save' to keep it)", c.ID, c.ID)
 }
 
-func (r *REPL) cmdResume(args []string) {
+func (r *REPL) cmdResume(ctx context.Context, args []string) {
 	if len(args) == 0 {
 		r.printf("resume: need a session id")
 		return
 	}
-	id := args[0]
-	if r.current == nil || r.current.id != id {
-		r.printf("no stopped capture %q to resume", id)
-		return
-	}
-	if r.current.running {
-		r.printf("capture %q is already running on %s", id, r.current.addr())
-		return
-	}
-	if err := r.current.resume(); err != nil {
+	c, err := r.svc.ResumeCapture(ctx, args[0])
+	if err != nil {
 		r.printf("resume: %v", err)
 		return
 	}
-	r.printf("resumed capture %q on %s", id, r.current.addr())
+	r.printf("resumed capture %q on %s", c.ID, c.Addr)
 }
 
 func (r *REPL) cmdSessions(ctx context.Context) {
-	infos, err := r.durable.Sessions(ctx)
+	infos, err := r.svc.Sessions(ctx)
 	if err != nil {
 		r.printf("sessions: %v", err)
 		return
 	}
-	if len(infos) == 0 && r.current == nil {
+	live, hasLive, err := r.svc.ActiveCapture(ctx)
+	if err != nil {
+		r.printf("sessions: %v", err)
+		return
+	}
+	if len(infos) == 0 && !hasLive {
 		r.printf("no sessions")
 		return
 	}
 	for _, si := range infos {
 		r.printf("  %-20s %d entries, %d connections  [stored]", si.Name, si.Entries, si.Connections)
 	}
-	if r.current != nil {
-		n, _ := r.current.count(ctx)
-		live := "stopped"
-		if r.current.running {
-			live = "live"
+	if hasLive {
+		state := "stopped"
+		if live.Running {
+			state = "live"
 		}
-		r.printf("* %-20s %d entries  [%s, memory only]", r.current.id, n, live)
+		r.printf("* %-20s %d entries, %d connections  [%s, memory only]", live.ID, live.Entries, live.Connections, state)
 	}
 }
 
@@ -270,7 +222,7 @@ func (r *REPL) cmdShow(ctx context.Context, args []string) {
 	if len(args) > 1 {
 		fmt.Sscanf(args[1], "%d", &limit)
 	}
-	d, err := r.repoFor(id).Session(ctx, id)
+	d, err := r.svc.Session(ctx, id)
 	if err != nil {
 		r.printf("show: %v", err)
 		return
@@ -287,12 +239,55 @@ func (r *REPL) cmdShow(ctx context.Context, args []string) {
 	}
 }
 
+func (r *REPL) cmdEntry(ctx context.Context, args []string) {
+	session, id, ok := r.parseTarget("entry", args)
+	if !ok {
+		return
+	}
+	st, err := r.svc.Entry(ctx, session, id)
+	if err != nil {
+		r.printf("entry: %v", err)
+		return
+	}
+	b, err := json.MarshalIndent(st.Entry, "", "  ")
+	if err != nil {
+		r.printf("entry: %v", err)
+		return
+	}
+	fmt.Fprintf(r.out, "%s\n", b)
+}
+
+func (r *REPL) cmdConnection(ctx context.Context, args []string) {
+	session, id, ok := r.parseTarget("conn", args)
+	if !ok {
+		return
+	}
+	c, err := r.svc.Connection(ctx, session, id)
+	if err != nil {
+		r.printf("conn: %v", err)
+		return
+	}
+	r.printf("connection %d of session %q", c.ID, c.Session)
+	r.printf("  clientHello  %s", elide(c.ClientHelloHex, 96))
+	if c.UpstreamProto != "" {
+		r.printf("  upstream     %s", c.UpstreamProto)
+	}
+	if c.HTTP2 == nil {
+		r.printf("  http2        none (HTTP/1.1 connection)")
+		return
+	}
+	r.printf("  settings     %v", c.HTTP2.Settings)
+	r.printf("  flow         %d", c.HTTP2.ConnectionFlow)
+	r.printf("  pseudoOrder  %s", strings.Join(c.HTTP2.PseudoOrder, ", "))
+	r.printf("  headerOrder  %s", strings.Join(c.HTTP2.HeaderOrder, ", "))
+}
+
 func (r *REPL) cmdRename(ctx context.Context, args []string) {
 	if len(args) < 2 {
 		r.printf("rename: need <old> <new>")
 		return
 	}
-	if err := r.durable.RenameSession(ctx, args[0], args[1]); err != nil {
+	if err := r.svc.RenameSession(ctx, args[0], args[1]); err != nil {
 		r.printf("rename: %v", err)
 		return
 	}
@@ -304,11 +299,23 @@ func (r *REPL) cmdDelete(ctx context.Context, args []string) {
 		r.printf("rm: need a session id")
 		return
 	}
-	if err := r.durable.DeleteSession(ctx, args[0]); err != nil {
+	if err := r.svc.DeleteSession(ctx, args[0]); err != nil {
 		r.printf("rm: %v", err)
 		return
 	}
 	r.printf("deleted stored session %q", args[0])
+}
+
+func (r *REPL) cmdDeleteEntry(ctx context.Context, args []string) {
+	session, id, ok := r.parseTarget("rm-entry", args)
+	if !ok {
+		return
+	}
+	if err := r.svc.DeleteEntry(ctx, session, id); err != nil {
+		r.printf("rm-entry: %v", err)
+		return
+	}
+	r.printf("deleted entry %d from session %q", id, session)
 }
 
 func (r *REPL) cmdExport(ctx context.Context, args []string) {
@@ -317,23 +324,17 @@ func (r *REPL) cmdExport(ctx context.Context, args []string) {
 		return
 	}
 	id := args[0]
-	var w io.Writer = r.out
-	var closer io.Closer
-	if len(args) > 1 {
-		f, err := os.Create(args[1])
-		if err != nil {
+	if len(args) == 1 {
+		if err := r.svc.Export(ctx, id, r.out); err != nil {
 			r.printf("export: %v", err)
-			return
 		}
-		w, closer = f, f
+		return
 	}
-	if err := exportHAR(ctx, r.repoFor(id), id, w); err != nil {
+	if err := r.svc.ExportFile(ctx, id, args[1]); err != nil {
 		r.printf("export: %v", err)
+		return
 	}
-	if closer != nil {
-		closer.Close()
-		r.printf("exported session %q to %s", id, args[1])
-	}
+	r.printf("exported session %q to %s", id, args[1])
 }
 
 func (r *REPL) cmdImport(ctx context.Context, args []string) {
@@ -341,83 +342,61 @@ func (r *REPL) cmdImport(ctx context.Context, args []string) {
 		r.printf("import: need a HAR file")
 		return
 	}
-	path := args[0]
-	id := strings.TrimSuffix(filepath.Base(path), filepath.Ext(path))
+	id := ""
 	if len(args) >= 3 && args[1] == "as" {
 		id = args[2]
 	}
-	f, err := os.Open(path)
+	n, err := r.svc.ImportFile(ctx, args[0], id)
 	if err != nil {
 		r.printf("import: %v", err)
 		return
 	}
-	defer f.Close()
-	n, err := importHAR(ctx, r.durable, id, f)
-	if err != nil {
-		r.printf("import: %v", err)
-		return
-	}
-	r.printf("imported %d entries into session %q", n, id)
+	r.printf("imported %d entries", n)
 }
 
 func (r *REPL) cmdCert() {
-	fmt.Fprintf(r.out, "CA certificate: %s\n\n%s", r.caCert, installHint(r.caCert))
+	info := r.svc.CertInfo()
+	fmt.Fprintf(r.out, "CA certificate: %s\n\n%s\n", info.Path, info.Instruction)
+	if info.TrustCmd != "" {
+		fmt.Fprintf(r.out, "  %s\n", info.TrustCmd)
+	}
 }
 
 func (r *REPL) cmdBrowser(args []string) {
-	if r.current == nil || !r.current.running {
-		r.printf("browser: no active capture to route through — 'run' one first")
-		return
-	}
-	url := "https://tls.peet.ws/api/all"
+	url := ""
 	if len(args) > 0 {
 		url = args[0]
 	}
-	ctx, cancel := context.WithCancel(context.Background())
-	r.browserCancel = append(r.browserCancel, cancel)
-	proxyURL := "http://" + r.current.addr()
-	go func() {
-		err := browser.Launch(ctx, browser.Options{
-			ProxyURL: proxyURL,
-			URL:      url,
-			Stdout:   io.Discard,
-			Stderr:   io.Discard,
-		})
-		if err != nil && ctx.Err() == nil {
-			r.printf("browser: %v", err)
-		}
-	}()
+	proxyURL, err := r.svc.LaunchBrowser(url)
+	if err != nil {
+		r.printf("browser: %v", err)
+		return
+	}
+	if url == "" {
+		url = "the fingerprint echo"
+	}
 	r.printf("launched Chrome at %s through %s", url, proxyURL)
 }
 
-// repoFor returns the repository that holds a session: the live in-memory one
-// when the id names the active capture, otherwise the durable one.
-func (r *REPL) repoFor(id string) *sqlite.Repository {
-	if r.current != nil && r.current.id == id {
-		return r.current.mem
+// parseTarget reads the "<session> <id>" argument pair shared by the commands
+// that address a single entry or connection.
+func (r *REPL) parseTarget(cmd string, args []string) (session string, id int64, ok bool) {
+	if len(args) < 2 {
+		r.printf("%s: need <session> <id>", cmd)
+		return "", 0, false
 	}
-	return r.durable
+	n, err := strconv.ParseInt(args[1], 10, 64)
+	if err != nil {
+		r.printf("%s: %q is not an id", cmd, args[1])
+		return "", 0, false
+	}
+	return args[0], n, true
 }
 
-func (r *REPL) shutdown() {
-	for _, cancel := range r.browserCancel {
-		cancel()
+// elide shortens a long hex blob for display, keeping the head that identifies it.
+func elide(s string, max int) string {
+	if len(s) <= max {
+		return s
 	}
-	if r.current != nil {
-		r.current.close()
-		r.current = nil
-	}
-}
-
-func installHint(certPath string) string {
-	switch runtime.GOOS {
-	case "darwin":
-		return fmt.Sprintf("Trust it (admin required):\n"+
-			"  sudo security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain %s\n", certPath)
-	case "linux":
-		return fmt.Sprintf("Trust it (Debian/Ubuntu):\n"+
-			"  sudo cp %s /usr/local/share/ca-certificates/lebedev.crt && sudo update-ca-certificates\n", certPath)
-	default:
-		return fmt.Sprintf("Import %s into your system or browser trust store as a trusted root.\n", certPath)
-	}
+	return s[:max] + fmt.Sprintf("… (%d bytes)", len(s)/2)
 }

@@ -25,9 +25,9 @@ be detected or would alter the very behavior you are trying to observe.
   repository. It round-trips every observation verbatim — header and cookie
   order, whitespace, URLs, form fields, and bodies — and stores one row per TLS
   connection instead of repeating a fingerprint on every entry.
-- **Interactive REPL** — a single prompt to start captures and CRUD stored
-  sessions. Built for a developer at the keyboard and for an LLM driving it
-  through an MCP server.
+- **Two front ends, one control surface** — an interactive REPL for a developer
+  at the keyboard and an MCP server for an LLM. Both are thin translations of the
+  same service package, so neither can do something the other cannot.
 - **In-memory captures** — a capture's session lives in memory and is discarded
   on exit; `save` it to the durable store (or export it to HAR) to keep it. The
   durable store itself survives across runs.
@@ -35,6 +35,7 @@ be detected or would alter the very behavior you are trying to observe.
   1.3 document and existing HAR files import back in. The raw TLS ClientHello and
   HTTP/2 fingerprint ride along in a custom `_lebedev` field.
 - **Small and dependency-light** — a single Go binary (pure-Go SQLite, no CGo).
+
 
 ## How it works
 
@@ -79,8 +80,10 @@ go build -o lebedev ./cmd/lebedev
 
 ## Quick start
 
-Running `lebedev` opens an interactive REPL. Startup ensures the root CA exists
-and opens the durable store (`~/.lebedev/lebedev.db` by default).
+`lebedev` opens an interactive REPL; `lebedev mcp` serves the same operations
+over the Model Context Protocol (see [MCP server](#mcp-server)). Either way,
+startup ensures the root CA exists and opens the durable store
+(`~/.lebedev/lebedev.db` by default).
 
 ```sh
 lebedev
@@ -131,6 +134,18 @@ saved session "my-app" to the durable store (12 entries)
 lebedev> export my-app my-app.har
 ```
 
+**5. Read what you captured.** `show` lists the session; `entry` opens one
+request/response, and `conn` prints the fingerprint it was captured over:
+
+```
+lebedev> show my-app 3
+    1  GET    200  conn 1    https://example.com/
+    2  GET    200  conn 1    https://example.com/app.js
+    3  POST   204  conn 2    https://example.com/api/telemetry
+lebedev> entry my-app 2
+lebedev> conn my-app 1
+```
+
 ## The REPL
 
 The durable store (the "system state") is opened for the life of the process and
@@ -141,18 +156,21 @@ growing session without duplicating entries.
 
 ```
 run [id] [--addr :8080] [--upstream-proxy URL]
-                       start a capture; entries stay in memory only
-save                   write the live session to the durable store
-stop <id>              stop the capture (its session stays queryable)
-resume <id>            resume a stopped capture on its address
-sessions | ls          list stored sessions (and the live one, if any)
-show <id> [limit]      list a session's entries
-export <id> [file]     write a session as HAR 1.3 (stdout if no file)
-import <file> [as id]  load a HAR 1.3 document into the durable store
-rename <old> <new>     rename a stored session
-rm <id>                delete a stored session
-cert                   print CA trust instructions
-browser [url]          launch a fresh Chrome through the active capture
+                          start a capture; entries stay in memory only
+save                      write the live session to the durable store
+stop <id>                 stop the capture (its session stays queryable)
+resume <id>               resume a stopped capture on its address
+sessions | ls             list stored sessions (and the live one, if any)
+show <id> [limit]         list a session's entries
+entry <session> <id>      print one entry as HAR JSON
+conn <session> <id>       print one TLS connection's fingerprint
+export <id> [file]        write a session as HAR 1.3 (stdout if no file)
+import <file> [as id]     load a HAR 1.3 document into the durable store
+rename <old> <new>        rename a stored session
+rm <id>                   delete a stored session
+rm-entry <session> <id>   delete one entry
+cert                      print CA trust instructions
+browser [url]             launch a fresh Chrome through the active capture
 help | quit
 ```
 
@@ -165,6 +183,48 @@ same address, appending new transactions to the same session. `save` writes the
 active capture to the durable store; `show`, `export`, and `sessions` operate on
 the live in-memory session when the id names the active capture, and on the
 durable store otherwise.
+
+`show` lists a session; `entry` reads one request/response in full, and `conn`
+prints the TLS and HTTP/2 fingerprint a group of entries was captured over.
+
+## MCP server
+
+`lebedev mcp` speaks the [Model Context Protocol](https://modelcontextprotocol.io)
+over stdio, so an LLM can drive a capture the way you drive the prompt. It is the
+same control surface: every command above is a tool, and both front ends call one
+service package, so they cannot drift apart.
+
+Point an MCP client at the binary:
+
+```json
+{
+  "mcpServers": {
+    "lebedev": {
+      "command": "lebedev",
+      "args": ["mcp"]
+    }
+  }
+}
+```
+
+| Tool | Does |
+| ---- | ---- |
+| `capture_start` / `capture_stop` / `capture_resume` | Serve, pause, and re-serve the proxy |
+| `capture_status` | Where it is listening and how much it has recorded |
+| `capture_save` | Copy the live in-memory session to the durable store |
+| `sessions_list` / `session_show` | List stored sessions; list one session's entries |
+| `entry_get` / `connection_get` | Read one entry in full; read the fingerprint it was captured over |
+| `session_rename` / `session_delete` / `entry_delete` | Session and entry CRUD |
+| `session_export` / `session_import` | Move HAR 1.3 documents in and out |
+| `cert_info` | Where the root CA lives and how to trust it |
+| `browser_launch` | Open a clean Chrome through the active capture |
+
+Two bounds keep a faithful store usable through a protocol that has to fit in a
+context window. `session_show` pages with `limit` and `offset` and reports the
+total, and `entry_get` clips bodies at `maxBodyBytes` (8 KiB by default, `-1` for
+the whole thing). A clipped body is flagged in the result and marked in its own
+`encoding` field, so a shortened observation can never be mistaken for the bytes
+on the wire. For those, export the session.
 
 ### Global flags
 
@@ -297,14 +357,20 @@ go test -race ./...
 
 The codebase is organized under `internal/`:
 
-| Package    | Responsibility                                                        |
-| ---------- | -------------------------------------------------------------------- |
-| `ca`       | Root CA and per-host leaf certificate minting.                       |
-| `proxy`    | MITM core: `CONNECT`, TLS termination, and upstream dispatch.        |
-| `capture`  | Faithful HTTP/1.1 and HTTP/2 request parsing and fingerprinting.     |
-| `upstream` | Stock latest-Chrome client that forwards requests to the origin.      |
-| `session`  | Turns each connection and transaction into records for a recorder.   |
-| `repl`     | Interactive control surface: captures, saving to the store, and session CRUD. |
+| Package     | Responsibility                                                     |
+| ----------- | ------------------------------------------------------------------ |
+| `ca`        | Root CA and per-host leaf certificate minting.                      |
+| `proxy`     | MITM core: `CONNECT`, TLS termination, and upstream dispatch.       |
+| `capture`   | Faithful HTTP/1.1 and HTTP/2 request parsing and fingerprinting.    |
+| `upstream`  | Stock latest-Chrome client that forwards requests to the origin.    |
+| `session`   | Turns each connection and transaction into records for a recorder.  |
+| `service`   | The control surface: captures, storage, HAR I/O, browser launching. |
+| `repl`      | Text front end over `service`.                                      |
+| `mcpserver` | MCP front end over `service`.                                       |
+
+`repl` and `mcpserver` hold no capture or storage logic. Everything either can do
+lives in `service`, which is what keeps the prompt and the protocol in step —
+adding an operation there surfaces it in both.
 
 Three packages are public, for consumers that want the model or the store
 without importing anything internal:

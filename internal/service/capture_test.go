@@ -1,7 +1,8 @@
-package repl
+package service
 
 import (
 	"context"
+	"errors"
 	"testing"
 
 	"github.com/ntakezo/lebedev/har"
@@ -61,10 +62,10 @@ func TestCaptureCountsRecordedEntries(t *testing.T) {
 	}
 }
 
-// TestSave verifies that save copies the live session to the durable repository,
-// that re-saving overwrites rather than duplicates, and that entries sharing a
-// connection still share one after the copy.
-func TestSave(t *testing.T) {
+// TestSaveCapture verifies that saving copies the live session to the durable
+// repository, that re-saving overwrites rather than duplicates, and that entries
+// sharing a connection still share one after the copy.
+func TestSaveCapture(t *testing.T) {
 	ctx := context.Background()
 	durable, err := sqlite.Open("")
 	if err != nil {
@@ -72,26 +73,27 @@ func TestSave(t *testing.T) {
 	}
 	defer durable.Close()
 
-	c := newTestCapture(t)
-	r := New(durable, nil, "", discard{})
-	r.current = c
+	svc := New(durable, nil, "/tmp/ca.crt")
+	svc.current = newTestCapture(t)
+	mem := svc.current.mem
 
 	// Nothing captured yet — durable stays empty.
-	r.cmdSave(ctx)
-	if _, err := durable.Session(ctx, "s1"); err == nil {
-		t.Fatal("durable should hold nothing before anything is captured")
+	if _, err := svc.SaveCapture(ctx); !errors.Is(err, ErrEmptyCapture) {
+		t.Fatalf("save of an empty capture: err = %v, want ErrEmptyCapture", err)
 	}
 
-	conn, err := c.mem.CreateConnection(ctx, "s1", model.Connection{ClientHelloHex: "1603"})
+	conn, err := mem.CreateConnection(ctx, "s1", model.Connection{ClientHelloHex: "1603"})
 	if err != nil {
 		t.Fatal(err)
 	}
 	for _, url := range []string{"https://a/1", "https://a/2"} {
-		if _, err := c.mem.CreateEntry(ctx, "s1", conn, testEntry(url)); err != nil {
+		if _, err := mem.CreateEntry(ctx, "s1", conn, testEntry(url)); err != nil {
 			t.Fatal(err)
 		}
 	}
-	r.cmdSave(ctx)
+	if n, err := svc.SaveCapture(ctx); err != nil || n != 2 {
+		t.Fatalf("save = %d, %v; want 2, nil", n, err)
+	}
 	d, err := durable.Session(ctx, "s1")
 	if err != nil {
 		t.Fatal(err)
@@ -109,22 +111,20 @@ func TestSave(t *testing.T) {
 	}
 
 	// A third entry plus a re-save snapshots the whole session without duplicating.
-	if _, err := c.mem.CreateEntry(ctx, "s1", conn, testEntry("https://a/3")); err != nil {
+	if _, err := mem.CreateEntry(ctx, "s1", conn, testEntry("https://a/3")); err != nil {
 		t.Fatal(err)
 	}
-	r.cmdSave(ctx)
+	if n, err := svc.SaveCapture(ctx); err != nil || n != 3 {
+		t.Fatalf("re-save = %d, %v; want 3, nil (overwrite, no dupes)", n, err)
+	}
 	d, err = durable.Session(ctx, "s1")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(d.Entries) != 3 {
-		t.Fatalf("durable entries after re-save = %d, want 3 (overwrite, no dupes)", len(d.Entries))
+		t.Fatalf("durable entries after re-save = %d, want 3", len(d.Entries))
 	}
 }
-
-type discard struct{}
-
-func (discard) Write(p []byte) (int, error) { return len(p), nil }
 
 // TestStopResume verifies that a capture can be stopped and then resumed on the
 // same bound address, and that the in-memory session survives the pause.
