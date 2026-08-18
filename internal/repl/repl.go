@@ -18,6 +18,7 @@ import (
 	"github.com/ntakezo/lebedev/har"
 	"github.com/ntakezo/lebedev/internal/browser"
 	"github.com/ntakezo/lebedev/internal/ca"
+	"github.com/ntakezo/lebedev/internal/proxy"
 	"github.com/ntakezo/lebedev/internal/store"
 	"github.com/ntakezo/lebedev/model"
 )
@@ -105,8 +106,11 @@ func (r *REPL) dispatch(line string) (quit bool) {
 
 func (r *REPL) help() {
 	fmt.Fprint(r.out, `commands:
-  run [id] [--addr :8080] [--upstream-proxy URL]
-                         start a capture; entries stay in memory only
+  run [id] [--addr :8080] [--upstream-proxy URL] [--fingerprint chrome|mirror]
+                         start a capture; entries stay in memory only.
+                         --fingerprint chrome (default) sends origin requests
+                         with the stock latest-Chrome profile; mirror replays
+                         the captured client's own fingerprint
   save                   write the live session to the durable store
   stop <id>              stop the capture (its session stays queryable)
   resume <id>            resume a stopped capture on its address
@@ -124,6 +128,7 @@ func (r *REPL) help() {
 
 func (r *REPL) cmdRun(args []string) {
 	id, addr, upstream := "default", ":8080", ""
+	fingerprint := proxy.StockChrome
 	positional := true
 	for i := 0; i < len(args); i++ {
 		switch args[i] {
@@ -136,6 +141,16 @@ func (r *REPL) cmdRun(args []string) {
 			if i+1 < len(args) {
 				i++
 				upstream = args[i]
+			}
+		case "--fingerprint":
+			if i+1 < len(args) {
+				i++
+				fp, err := parseFingerprint(args[i])
+				if err != nil {
+					r.printf("run: %v", err)
+					return
+				}
+				fingerprint = fp
 			}
 		default:
 			if positional && !strings.HasPrefix(args[i], "--") {
@@ -154,13 +169,24 @@ func (r *REPL) cmdRun(args []string) {
 		r.current = nil
 	}
 
-	c, err := startCapture(id, addr, upstream, r.authority)
+	c, err := startCapture(id, addr, upstream, fingerprint, r.authority)
 	if err != nil {
 		r.printf("run: %v", err)
 		return
 	}
 	r.current = c
-	r.printf("capturing session %q on %s — entries are in memory only ('save' to keep them)", id, c.addr())
+	r.printf("capturing session %q on %s with the %s fingerprint — entries are in memory only ('save' to keep them)", id, c.addr(), fingerprint)
+}
+
+// parseFingerprint resolves the --fingerprint argument to an upstream mode.
+func parseFingerprint(name string) (proxy.Fingerprint, error) {
+	switch proxy.Fingerprint(name) {
+	case proxy.StockChrome:
+		return proxy.StockChrome, nil
+	case proxy.MirrorClient:
+		return proxy.MirrorClient, nil
+	}
+	return "", fmt.Errorf("unknown fingerprint %q — want %q or %q", name, proxy.StockChrome, proxy.MirrorClient)
 }
 
 // cmdSave writes the live session's in-memory entries to the durable store. It

@@ -230,3 +230,18 @@ func caPool(t *testing.T, a *ca.Authority) *x509.CertPool {
 	pool.AddCert(cert)
 	return pool
 }
+
+func TestDialerForSelectsUpstreamClient(t *testing.T) {
+	for _, tc := range []struct {
+		fp   Fingerprint
+		want dialer
+	}{
+		{MirrorClient, mirrorDialer{proxyURL: "http://p"}},
+		{StockChrome, stockChromeDialer{proxyURL: "http://p"}},
+		{"", stockChromeDialer{proxyURL: "http://p"}},
+	} {
+		if got := dialerFor(tc.fp, "http://p"); got != tc.want {
+			t.Errorf("dialerFor(%q) = %#v, want %#v", tc.fp, got, tc.want)
+		}
+	}
+}

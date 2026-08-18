@@ -1,7 +1,8 @@
 // Package proxy is the MITM core: it accepts CONNECT tunnels, peeks the raw
 // ClientHello for fingerprinting, terminates TLS with a per-host leaf, captures
 // the request faithfully (HTTP/1.1 or HTTP/2), and forwards it upstream through
-// a client that mirrors the captured fingerprint.
+// a client whose fingerprint is either the stock latest-Chrome profile or a
+// mirror of the captured client's own (see Fingerprint).
 package proxy
 
 import (
@@ -33,6 +34,14 @@ func (d mirrorDialer) forConn(rawHello []byte, fp capture.HTTP2Fingerprint, h2 b
 	return upstream.NewMirror(rawHello, fp, h2, d.proxyURL)
 }
 
+// stockChromeDialer ignores the captured fingerprint and sends every request
+// with the stock latest-Chrome profile instead.
+type stockChromeDialer struct{ proxyURL string }
+
+func (d stockChromeDialer) forConn(_ []byte, _ capture.HTTP2Fingerprint, h2 bool) (roundTripper, error) {
+	return upstream.NewStockChrome(h2, d.proxyURL)
+}
+
 // Transaction is one captured request together with the response returned to
 // the client and the client fingerprint it was served under. H2 is the zero
 // value for HTTP/1.1 connections.
@@ -43,11 +52,24 @@ type Transaction struct {
 	Response    capture.Response
 }
 
+// Fingerprint names which fingerprint origin traffic is sent with.
+type Fingerprint string
+
+const (
+	// MirrorClient reproduces the captured client's ClientHello and h2 traits.
+	MirrorClient Fingerprint = "mirror"
+	// StockChrome sends every request with tls-client's latest Chrome profile,
+	// discarding the captured fingerprint.
+	StockChrome Fingerprint = "chrome"
+)
+
 // Options configures a Server. OutboundProxy, when set, routes all origin
-// traffic through that proxy. OnTransaction, when set, is called once per
-// completed request/response for streaming or logging.
+// traffic through that proxy. Fingerprint selects the upstream fingerprint and
+// defaults to StockChrome when empty. OnTransaction, when set, is called once
+// per completed request/response for streaming or logging.
 type Options struct {
 	OutboundProxy string
+	Fingerprint   Fingerprint
 	OnTransaction func(Transaction)
 }
 
@@ -59,14 +81,23 @@ type Server struct {
 	onTx      func(Transaction)
 }
 
-// New returns a proxy that mints leaves from authority and forwards through a
-// fingerprint-mirroring upstream client, honoring opts.
+// New returns a proxy that mints leaves from authority and forwards through the
+// upstream client opts.Fingerprint selects, honoring the rest of opts.
 func New(authority *ca.Authority, opts Options) *Server {
 	return &Server{
 		authority: authority,
-		dialer:    mirrorDialer{proxyURL: opts.OutboundProxy},
+		dialer:    dialerFor(opts.Fingerprint, opts.OutboundProxy),
 		onTx:      opts.OnTransaction,
 	}
+}
+
+// dialerFor picks the upstream dialer for a fingerprint mode, treating anything
+// but an explicit MirrorClient as the stock-Chrome default.
+func dialerFor(fp Fingerprint, proxyURL string) dialer {
+	if fp == MirrorClient {
+		return mirrorDialer{proxyURL: proxyURL}
+	}
+	return stockChromeDialer{proxyURL: proxyURL}
 }
 
 func (s *Server) emit(tx Transaction) {

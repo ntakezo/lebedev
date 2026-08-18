@@ -8,6 +8,7 @@ import (
 	"sync"
 
 	"github.com/ntakezo/lebedev/internal/ca"
+	"github.com/ntakezo/lebedev/internal/proxy"
 	"github.com/ntakezo/lebedev/internal/session"
 	"github.com/ntakezo/lebedev/internal/store"
 	"github.com/ntakezo/lebedev/model"
@@ -22,6 +23,7 @@ type capture struct {
 	mem           *store.Store
 	authority     *ca.Authority
 	upstreamProxy string
+	fingerprint   proxy.Fingerprint
 
 	mu       sync.Mutex
 	bindAddr string // concrete bound address, reused when resuming
@@ -31,8 +33,9 @@ type capture struct {
 }
 
 // startCapture opens an in-memory store for the session and begins serving the
-// MITM proxy on addr. Entries live only in memory for the life of the capture.
-func startCapture(id, addr, upstreamProxy string, authority *ca.Authority) (*capture, error) {
+// MITM proxy on addr with the given upstream fingerprint. Entries live only in
+// memory for the life of the capture.
+func startCapture(id, addr, upstreamProxy string, fingerprint proxy.Fingerprint, authority *ca.Authority) (*capture, error) {
 	mem, err := store.Open("")
 	if err != nil {
 		return nil, err
@@ -42,6 +45,7 @@ func startCapture(id, addr, upstreamProxy string, authority *ca.Authority) (*cap
 		mem:           mem,
 		authority:     authority,
 		upstreamProxy: upstreamProxy,
+		fingerprint:   fingerprint,
 		bindAddr:      addr,
 	}
 	if err := c.serve(); err != nil {
@@ -63,7 +67,7 @@ func (c *capture) serve() error {
 	c.ln = ln
 	c.serveErr = make(chan error, 1)
 	c.running = true
-	sess := session.New(session.Config{ID: c.id, OutboundProxy: c.upstreamProxy}, c.authority, c)
+	sess := session.New(session.Config{ID: c.id, OutboundProxy: c.upstreamProxy, Fingerprint: c.fingerprint}, c.authority, c)
 	go func() { c.serveErr <- sess.Serve(ln) }()
 	return nil
 }

@@ -6,6 +6,7 @@ import (
 
 	"github.com/ntakezo/lebedev/har"
 	"github.com/ntakezo/lebedev/internal/ca"
+	"github.com/ntakezo/lebedev/internal/proxy"
 	"github.com/ntakezo/lebedev/internal/store"
 	"github.com/ntakezo/lebedev/model"
 )
@@ -97,7 +98,7 @@ func TestStopResume(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	c, err := startCapture("s1", "127.0.0.1:0", "", authority)
+	c, err := startCapture("s1", "127.0.0.1:0", "", proxy.MirrorClient, authority)
 	if err != nil {
 		t.Fatal(err)
 	}

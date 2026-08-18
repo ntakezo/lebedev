@@ -3,10 +3,11 @@
 ![Go](https://img.shields.io/badge/Go-1.25-00ADD8?logo=go&logoColor=white)
 ![License](https://img.shields.io/badge/License-MIT-blue)
 
-Lebedev is a lightweight man-in-the-middle proxy that **mirrors the client it
-intercepts**. Instead of re-originating traffic with its own fingerprint, it
-reconstructs the captured client's TLS ClientHello and HTTP/2 traits and replays
-them upstream, so the origin sees a connection that matches the real client —
+Lebedev is a lightweight man-in-the-middle proxy that **never re-originates
+traffic with a proxy fingerprint**. Origin requests go out over an fhttp
+tls-client wearing a real browser's TLS ClientHello and HTTP/2 traits — by
+default the stock latest-Chrome profile (`Chrome_150_PSK`), or, with
+`--fingerprint mirror`, the intercepted client's own reconstructed fingerprint —
 while every request and response is recorded as structured, faithful data for
 inspection.
 
@@ -15,7 +16,8 @@ be detected or would alter the very behavior you are trying to observe.
 
 ## Features
 
-- **Fingerprint-mirroring upstream** — reproduces the client's JA3/JA4
+- **Browser-fingerprinted upstream** — sends origin traffic with tls-client's
+  stock latest-Chrome profile, or mirrors the intercepted client's own JA3/JA4
   ClientHello and HTTP/2 SETTINGS, priorities, flow control, and header ordering.
 - **HTTP/3 upgrade** — when an origin advertises HTTP/3 via `Alt-Svc`, the mirror
   upgrades that origin from h2 to h3 for subsequent requests, exactly as a real
@@ -58,7 +60,8 @@ be detected or would alter the very behavior you are trying to observe.
    signed by the local root CA.
 3. It parses the request without canonicalizing order, casing, or body.
 4. It forwards the request to the origin through an upstream client whose TLS and
-   HTTP/2 fingerprint reproduce the captured client.
+   HTTP/2 fingerprint is the stock latest-Chrome profile, or the captured
+   client's own under `--fingerprint mirror`.
 5. The origin's response is returned to the client, and the full transaction is
    recorded as a HAR entry — queryable and exportable on demand.
 
@@ -141,7 +144,7 @@ HAR file). Re-running `save` overwrites the stored copy, so it snapshots the
 growing session without duplicating entries.
 
 ```
-run [id] [--addr :8080] [--upstream-proxy URL]
+run [id] [--addr :8080] [--upstream-proxy URL] [--fingerprint chrome|mirror]
                        start a capture; entries stay in memory only
 save                   write the live session to the durable store
 stop <id>              stop the capture (its session stays queryable)
@@ -157,8 +160,13 @@ browser [url]          launch a fresh Chrome through the active capture
 help | quit
 ```
 
-`run` takes an optional session id (default `default`), the listen address, and
-an optional per-session outbound proxy. `stop <id>` pauses the capture named by
+`run` takes an optional session id (default `default`), the listen address, an
+optional per-session outbound proxy, and the upstream fingerprint. `--fingerprint
+chrome` (the default) sends origin requests with tls-client's stock latest-Chrome
+profile — Chrome 150 with real PSK resumption — while `--fingerprint mirror`
+replays the captured client's own ClientHello and h2 traits.
+
+`stop <id>` pauses the capture named by
 id, leaving its in-memory session queryable; `resume <id>` re-serves it on the
 same address, appending new transactions to the same session. `save` writes the
 active capture to the durable store; `show`, `export`, and `sessions` operate on
@@ -251,7 +259,15 @@ matching `_lebedev.upstreamProto`; for h2/h1 the field is omitted.
 
 ## Fidelity and detection surface
 
-Lebedev reproduces the captured client toward the origin at several layers:
+By default Lebedev sends origin traffic with the stock latest-Chrome profile
+(`Chrome_150_PSK`), which supplies the ClientHello, h2 SETTINGS, and
+pseudo-header order; the captured request's headers, header order, and body are
+still reproduced verbatim. `--fingerprint mirror` swaps that profile for the
+captured client's own fingerprint, which is what the rest of this section
+describes.
+
+In mirror mode Lebedev reproduces the captured client toward the origin at
+several layers:
 
 - **TLS ClientHello (JA3/JA4):** cipher suites, extensions, curves, and ALPN are
   reconstructed from the raw ClientHello.

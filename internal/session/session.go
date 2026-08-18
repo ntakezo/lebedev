@@ -23,10 +23,12 @@ type Recorder interface {
 }
 
 // Config is the per-session configuration. OutboundProxy, when set, routes this
-// session's origin traffic through that proxy.
+// session's origin traffic through that proxy. Fingerprint selects the upstream
+// fingerprint and defaults to the proxy's stock-Chrome profile when empty.
 type Config struct {
 	ID            string
 	OutboundProxy string
+	Fingerprint   proxy.Fingerprint
 }
 
 // Session serves a MITM proxy and records its transactions into a recorder.
@@ -53,6 +55,7 @@ func New(config Config, authority *ca.Authority, rec Recorder) *Session {
 func (s *Session) Serve(ln net.Listener) error {
 	srv := proxy.New(s.authority, proxy.Options{
 		OutboundProxy: s.config.OutboundProxy,
+		Fingerprint:   s.config.Fingerprint,
 		OnTransaction: s.record,
 	})
 	return srv.Serve(ln)

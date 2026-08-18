@@ -419,3 +419,54 @@ func equalStrings(a, b []string) bool {
 	}
 	return true
 }
+
+func TestStockChromeUsesProfilePseudoOrder(t *testing.T) {
+	req := captureH2Request(t, []hpack.HeaderField{
+		{Name: ":method", Value: "GET"},
+		{Name: ":authority", Value: "example.com"},
+		{Name: ":scheme", Value: "https"},
+		{Name: ":path", Value: "/p"},
+		{Name: "user-agent", Value: "UA"},
+	}, nil)
+
+	stock, err := Mirror{usedH2: true, stock: true}.buildRequest(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if po, ok := stock.Header[http.PHeaderOrderKey]; ok {
+		t.Errorf("stock profile should supply its own pseudo order, got %v", po)
+	}
+	// The captured header order still drives the ordinary headers.
+	if !slices.Contains(stock.Header[http.HeaderOrderKey], "user-agent") {
+		t.Error("captured header order should still be reproduced")
+	}
+
+	mirrored, err := Mirror{usedH2: true}.buildRequest(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := mirrored.Header[http.PHeaderOrderKey]; !ok {
+		t.Error("mirror mode should reproduce the captured pseudo order")
+	}
+}
+
+func TestNewStockChromeBuildsStockClient(t *testing.T) {
+	for _, h2 := range []bool{true, false} {
+		m, err := NewStockChrome(h2, "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !m.stock {
+			t.Errorf("h2=%v: mirror should be marked stock", h2)
+		}
+		if m.usedH2 != h2 {
+			t.Errorf("h2=%v: usedH2 = %v, want %v", h2, m.usedH2, h2)
+		}
+		if (m.up != nil) != h2 {
+			t.Errorf("h2=%v: h3 upgrade state presence = %v, want %v", h2, m.up != nil, h2)
+		}
+	}
+	if got := stockChromeProfile.GetClientHelloStr(); got != "Chrome-150_PSK" {
+		t.Errorf("stock profile = %q, want the latest Chrome PSK profile", got)
+	}
+}

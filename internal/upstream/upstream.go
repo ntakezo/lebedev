@@ -1,6 +1,7 @@
-// Package upstream forwards captured requests to their origin through a
-// tls-client whose TLS ClientHello and HTTP/2 traits reproduce the client that
-// was captured, so the origin cannot distinguish the proxy from that client.
+// Package upstream forwards captured requests to their origin through an fhttp
+// tls-client. Its TLS ClientHello and HTTP/2 traits come either from the stock
+// latest-Chrome profile (NewStockChrome) or from the captured client itself
+// (NewMirror), so the origin sees a real browser either way.
 package upstream
 
 import (
@@ -29,7 +30,10 @@ import (
 type Mirror struct {
 	h2Client tlsclient.HttpClient
 	usedH2   bool
-	up       *h3upgrade
+	// stock is set when a canned browser profile, not the capture, supplies the
+	// fingerprint, so the profile's own pseudo-header order is left to stand.
+	stock bool
+	up    *h3upgrade
 }
 
 // h3upgrade holds one authority's HTTP/3 upgrade state, shared across the
@@ -101,7 +105,33 @@ func NewMirror(rawClientHello []byte, fp capture.HTTP2Fingerprint, clientUsedH2 
 	if err != nil {
 		return Mirror{}, err
 	}
+	return newMirror(profile, clientUsedH2, proxyURL)
+}
 
+// stockChromeProfile is the newest Chrome profile tls-client ships: Chrome 150
+// with real PSK resumption, so the stock client resumes sessions upstream the
+// way a revisiting browser does. Bump it when a newer profile lands.
+var stockChromeProfile = profiles.Chrome_150_PSK
+
+// NewStockChrome builds an upstream client that sends every request with the
+// stock latest-Chrome profile in place of the captured client's fingerprint:
+// the ClientHello, h2 SETTINGS, and pseudo-header order all come from the
+// profile. The captured request's header order and body are still reproduced,
+// and clientUsedH2 still keeps an h1 client on h1. Use it when a mirrored hello
+// is being rejected and a known-good browser fingerprint is preferable to a
+// faithful one.
+func NewStockChrome(clientUsedH2 bool, proxyURL string) (Mirror, error) {
+	m, err := newMirror(stockChromeProfile, clientUsedH2, proxyURL)
+	if err != nil {
+		return Mirror{}, err
+	}
+	m.stock = true
+	return m, nil
+}
+
+// newMirror wires one client profile into the origin-facing client(s): a single
+// h2 (or forced h1) client, plus the lazily built h3 racer for h2 clients.
+func newMirror(profile profiles.ClientProfile, clientUsedH2 bool, proxyURL string) (Mirror, error) {
 	base := []tlsclient.HttpClientOption{
 		tlsclient.WithClientProfile(profile),
 		tlsclient.WithNotFollowRedirects(),
@@ -234,7 +264,9 @@ func (m Mirror) buildRequest(req capture.Request) (*http.Request, error) {
 		hr.Header[h.Name] = append(hr.Header[h.Name], h.Value)
 	}
 	hr.Header[http.HeaderOrderKey] = order
-	if po := req.PseudoOrder(); po != nil {
+	// A stock profile carries its own pseudo-header order; overriding it with the
+	// capture's would leave the fingerprint half-mirrored.
+	if po := req.PseudoOrder(); po != nil && !m.stock {
 		hr.Header[http.PHeaderOrderKey] = po
 	}
 	return hr, nil

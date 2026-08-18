@@ -4,7 +4,7 @@ go 1.25.0
 
 require (
 	github.com/bogdanfinn/fhttp v0.6.8
-	github.com/bogdanfinn/tls-client v1.15.1
+	github.com/bogdanfinn/tls-client v1.15.2-0.20260702071810-b790a311273f
 	github.com/bogdanfinn/utls v1.7.7-barnius
 	github.com/jackc/pgx/v5 v5.10.0
 	golang.org/x/net v0.56.0
